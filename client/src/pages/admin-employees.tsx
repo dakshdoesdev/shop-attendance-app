@@ -254,7 +254,7 @@ export default function AdminEmployees() {
                         <FormItem>
                           <FormLabel>Username</FormLabel>
                           <FormControl>
-                            <Input {...field} data-testid="input-new-username" />
+                            <Input {...field} data-testid="input-new-username" autoComplete="username" />
                           </FormControl>
                           <FormMessage />
                         </FormItem>
@@ -272,6 +272,7 @@ export default function AdminEmployees() {
                           <FormControl>
                             <Input 
                               type="password"
+                              autoComplete="new-password"
                               {...field} 
                               data-testid="input-new-password"
                             />
@@ -362,7 +363,7 @@ export default function AdminEmployees() {
                         <FormItem>
                           <FormLabel>Password</FormLabel>
                           <FormControl>
-                            <Input type="password" {...field} data-testid="input-edit-password" />
+                            <Input type="password" autoComplete="new-password" {...field} data-testid="input-edit-password" />
                           </FormControl>
                           <FormMessage />
                         </FormItem>

@@ -76,6 +76,7 @@ export default function AdminLogin() {
                       <FormControl>
                         <Input 
                           {...field}
+                          autoComplete="username"
                           data-testid="input-admin-username"
                           className="px-4 py-3"
                         />
@@ -95,6 +96,7 @@ export default function AdminLogin() {
                         <Input 
                           type="password"
                           placeholder="Enter password"
+                          autoComplete="current-password"
                           {...field}
                           data-testid="input-admin-password"
                           className="px-4 py-3"

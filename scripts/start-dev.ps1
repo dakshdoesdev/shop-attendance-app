@@ -67,7 +67,8 @@ try {
     $cfgUrl = "$($env:SUPABASE_URL.TrimEnd('/'))/storage/v1/object/public/$bucket/$object"
     Write-Host "Publishing API config to Supabase Storage: $cfgUrl"
     # Publish using direct REST call (avoids path issues with external script)
-    $uri = "$($env:SUPABASE_URL.TrimEnd('/'))/storage/v1/object/$bucket/$object"
+    # Set cacheControl=0 to minimize CDN caching of the public object
+    $uri = "$($env:SUPABASE_URL.TrimEnd('/'))/storage/v1/object/$bucket/$object?cacheControl=0"
     $body = @{ apiBase = $publicUrl; uploadBase = $publicUrl; updatedAt = (Get-Date -Format o) } | ConvertTo-Json -Depth 3
     $headers = @{
       'Authorization' = "Bearer $($env:SUPABASE_SERVICE_KEY)"
@@ -79,8 +80,10 @@ try {
 
     # Verify that the public JSON reflects the latest URL
     try {
+      # Bust CDN caches when verifying by appending a timestamp query param
       $verifyHeaders = @{ 'Cache-Control' = 'no-cache' }
-      $fetched = Invoke-RestMethod -Uri $cfgUrl -Method GET -Headers $verifyHeaders -TimeoutSec 10
+      $verifyUrl = "$cfgUrl?v=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
+      $fetched = Invoke-RestMethod -Uri $verifyUrl -Method GET -Headers $verifyHeaders -TimeoutSec 10
       $apiBase = ($fetched | Select-Object -ExpandProperty apiBase -ErrorAction SilentlyContinue)
       $uploadBase = ($fetched | Select-Object -ExpandProperty uploadBase -ErrorAction SilentlyContinue)
       Write-Host ("Verified config: apiBase={0}, uploadBase={1}" -f $apiBase, $uploadBase)
@@ -100,6 +103,10 @@ try {
 # Ensure database schema is ready before starting the server
 try {
   Write-Host "Ensuring database schema (users default times) ..."
+  # Warn if using Supabase pooler for DDL without a direct URL available
+  if ($env:DATABASE_URL -and -not $env:DIRECT_DATABASE_URL -and ($env:DATABASE_URL -match 'pooler\.supabase\.com')) {
+    Write-Warning "DATABASE_URL points to Supabase pooler; DDL may fail. Set DIRECT_DATABASE_URL to the non-pooled connection string for setup."
+  }
   # Lightweight, safe DDL that only adds missing columns
   npx tsx tools/ensure-db.ts
 } catch {

@@ -13,11 +13,9 @@ async function bootstrap() {
           const apiBase = (cfg as any).apiBase as string | undefined;
           const uploadBase = (cfg as any).uploadBase as string | undefined;
           try {
-            // Only set from remote config if no manual override exists locally
-            const hasApiOverride = !!localStorage.getItem('apiBase');
-            const hasUploadOverride = !!localStorage.getItem('uploadBase');
-            if (apiBase && !hasApiOverride) localStorage.setItem('apiBase', apiBase);
-            if (uploadBase && !hasUploadOverride) localStorage.setItem('uploadBase', uploadBase);
+            // Always refresh from remote config so new tunnels take effect
+            if (apiBase) localStorage.setItem('apiBase', apiBase);
+            if (uploadBase) localStorage.setItem('uploadBase', uploadBase);
           } catch {}
         }
       }

@@ -2,7 +2,8 @@ import 'dotenv/config';
 import { Pool } from 'pg';
 
 async function main() {
-  const url = process.env.DATABASE_URL;
+  // Prefer a direct (non-pooler) DB URL for DDL, fallback to DATABASE_URL
+  const url = process.env.DIRECT_DATABASE_URL || process.env.DATABASE_URL;
   if (!url) {
     console.log('No DATABASE_URL set; skipping DB ensure.');
     return;
@@ -18,6 +19,13 @@ async function main() {
     ...(noSslVerify ? { ssl: { rejectUnauthorized: false } } : {}),
   });
 
+  // Prevent unhandled 'error' events from crashing the process if the
+  // database terminates connections unexpectedly (e.g., Supabase auto-pause).
+  // Log and continue; the script will retry or exit via catch below.
+  pool.on('error', (err) => {
+    console.error('Postgres pool error during ensure:', err);
+  });
+
   // Wake paused DBs (e.g., Supabase free tier)
   for (let i = 0; i < 10; i++) {
     try {
@@ -28,6 +36,16 @@ async function main() {
       await new Promise(r => setTimeout(r, 1500));
     }
   }
+
+  // Warn if running against Supabase pooler which may block DDL
+  try {
+    const u = new URL(url);
+    if (u.hostname.includes('pooler.supabase.com')) {
+      console.warn(
+        'Detected Supabase pooler host. DDL may fail. Set DIRECT_DATABASE_URL to the non-pooler connection string for setup.'
+      );
+    }
+  } catch {}
 
   // Verify users table exists
   const existsRes = await pool.query<{ exists: boolean }>(

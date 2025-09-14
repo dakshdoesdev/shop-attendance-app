@@ -28,7 +28,14 @@ export const db = drizzle(pool, { schema });
 
 // Avoid crashing the process on transient database shutdowns (e.g., Supabase auto-pause)
 // pg emits 'error' on the pool when a backend connection dies unexpectedly.
-pool.on('error', (err) => {
+pool.on('error', (err: any) => {
+  // Benign on Supabase: pooled backends can be terminated (e.g., auto-pause or DDL attempts elsewhere)
+  const msg = String(err?.message || err || '');
+  const code = (err && (err.code as string)) || '';
+  if (code === 'XX000' || msg.includes('db_termination') || msg.includes('{:shutdown')) {
+    console.warn('Postgres connection closed by server (likely pooled backend). Will reconnect on next query.');
+    return;
+  }
   // Log and let future queries reconnect instead of bringing down the server
   console.error('Unexpected Postgres pool error. Will retry on next query:', err);
 });

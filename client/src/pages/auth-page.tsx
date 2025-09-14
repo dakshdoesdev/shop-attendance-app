@@ -66,6 +66,7 @@ export default function AuthPage() {
                             <FormControl>
                               <Input 
                                 placeholder="Enter username" 
+                                autoComplete="username"
                                 {...field}
                                 data-testid="input-username"
                               />
@@ -85,6 +86,7 @@ export default function AuthPage() {
                               <Input
                                 type="password"
                                 placeholder="Enter password"
+                                autoComplete="current-password"
                                 {...field}
                                 data-testid="input-password"
                               />
