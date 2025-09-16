@@ -1,6 +1,5 @@
 import 'dotenv/config';
 import express, { type Request, Response, NextFunction } from "express";
-import cors from "cors";
 import { registerRoutes } from "./routes";
 import { setupAuth } from "./auth";
 import { setupVite, serveStatic, log } from "./vite";
@@ -25,44 +24,6 @@ const allowList = new Set<string>([
   "https://localhost",
 ].filter(Boolean));
 
-const dynamicCorsOrigin: cors.CorsOptions['origin'] = (origin, callback) => {
-  if (!origin) return callback(null, true); // non-CORS request
-  try {
-    const o = new URL(origin);
-    const host = o.hostname;
-    // Explicit allowlist or common dev hosts
-    if (allowList.has(origin)) return callback(null, true);
-    // Allow common tunnel domains
-    if (host.endsWith('.ngrok-free.app')) return callback(null, true);
-    if (host.endsWith('.loca.lt')) return callback(null, true); // localtunnel
-    if (host.endsWith('.trycloudflare.com')) return callback(null, true); // cloudflared quick tunnel
-    if (host.endsWith('.deno.dev')) return callback(null, true); // Deno Deploy (legacy)
-    if (host.endsWith('.deno.net')) return callback(null, true); // Deno Deploy (new domains)
-    // Allow typical LAN hosts
-    if (/^(10\.|192\.168\.|172\.)/.test(host)) return callback(null, true);
-  } catch {}
-  return callback(null, false);
-};
-
-app.use(cors({ origin: dynamicCorsOrigin, credentials: true }));
-
-// Ensure CORS headers are present on all responses for allowed origins
-app.use((req, res, next) => {
-  const origin = req.headers.origin as string | undefined;
-  if (isAllowedOrigin(origin)) {
-    if (origin) {
-      res.header('Access-Control-Allow-Origin', origin);
-      res.header('Vary', 'Origin');
-    }
-    res.header('Access-Control-Allow-Credentials', 'true');
-  }
-  next();
-});
-
-// Handle preflight for all routes
-app.options("*", cors({ credentials: true, origin: dynamicCorsOrigin }));
-
-// Defensive preflight handler to ensure CORS headers are present even if other middleware short-circuits
 function isAllowedOrigin(origin: string | undefined): boolean {
   if (!origin) return true; // non-CORS request
   try {
@@ -79,22 +40,34 @@ function isAllowedOrigin(origin: string | undefined): boolean {
   return false;
 }
 
+// Global CORS middleware (manual, to avoid accidental '*')
 app.use((req, res, next) => {
-  if (req.method === 'OPTIONS') {
-    const origin = req.headers.origin as string | undefined;
-    if (isAllowedOrigin(origin)) {
-      if (origin) {
-        res.header('Access-Control-Allow-Origin', origin);
-        res.header('Vary', 'Origin');
-      }
-      res.header('Access-Control-Allow-Credentials', 'true');
-      res.header('Access-Control-Allow-Methods', (req.headers['access-control-request-method'] as string) || 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-      res.header('Access-Control-Allow-Headers', (req.headers['access-control-request-headers'] as string) || 'Content-Type, Authorization, X-Requested-With, X-Device-Id');
-      return res.sendStatus(204);
+  const origin = req.headers.origin as string | undefined;
+  if (isAllowedOrigin(origin)) {
+    if (origin) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
     }
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
   }
   next();
 });
+
+// Preflight handler for all routes
+app.options("*", (req, res) => {
+  const origin = req.headers.origin as string | undefined;
+  if (!isAllowedOrigin(origin)) return res.sendStatus(403);
+  if (origin) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  }
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Methods', (req.headers['access-control-request-method'] as string) || 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', (req.headers['access-control-request-headers'] as string) || 'Content-Type, Authorization, X-Requested-With, X-Device-Id');
+  return res.sendStatus(204);
+});
+
+// No-op: preflight already handled; proceed for others
 
 app.use((req, res, next) => {
   const start = Date.now();

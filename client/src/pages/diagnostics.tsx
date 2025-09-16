@@ -2,27 +2,17 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { getApiBase, getUploadBase } from "@/lib/queryClient";
-import { Capacitor } from "@capacitor/core";
-import {
-  requestAllAndroidPermissions,
-  startBackgroundRecording,
-  stopBackgroundRecording,
-  recordingStatus,
-  setUploadConfig,
-  debugTestRecord,
-} from "@/lib/native-recorder";
 
 export default function Diagnostics() {
   const [health, setHealth] = useState<string>("not-run");
   const [userRes, setUserRes] = useState<string>("not-run");
   const [wsStatus, setWsStatus] = useState<string>("idle");
   const [micTest, setMicTest] = useState<string>("idle");
-  const [nativeStatus, setNativeStatus] = useState<string>("idle");
-  const [permStatus, setPermStatus] = useState<string>("idle");
+  // Native status/permissions removed in web-only build
   const [token, setToken] = useState<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
 
-  const platform = Capacitor.getPlatform();
+  const platform = 'web';
   const [apiBase, setApiBase] = useState<string>(() => {
     try { return localStorage.getItem('apiBase') || getApiBase(); } catch { return getApiBase(); }
   });
@@ -55,7 +45,7 @@ export default function Diagnostics() {
 
   async function pingHealth() {
     try {
-      const res = await fetch(`${getApiBase() || ''}/api/health`, { credentials: 'include' });
+      const res = await fetch(`${getApiBase() || ''}/api/health`, { credentials: 'include', headers: { 'ngrok-skip-browser-warning': 'true' } });
       const json = await res.json().catch(() => ({}));
       setHealth(`${res.status} ${res.ok ? 'OK' : 'ERR'} :: ${JSON.stringify(json)}`);
     } catch (e: any) {
@@ -65,7 +55,7 @@ export default function Diagnostics() {
 
   async function pingUser() {
     try {
-      const res = await fetch(`${getApiBase() || ''}/api/user`, { credentials: 'include' });
+      const res = await fetch(`${getApiBase() || ''}/api/user`, { credentials: 'include', headers: { 'ngrok-skip-browser-warning': 'true' } });
       const txt = await res.text();
       setUserRes(`${res.status} ${res.ok ? 'OK' : 'ERR'} :: ${txt}`);
     } catch (e: any) {
@@ -111,49 +101,11 @@ export default function Diagnostics() {
     }
   }
 
-  async function requestAndroidPerms() {
-    setPermStatus('requesting');
-    try {
-      const perms = await requestAllAndroidPermissions();
-      setPermStatus(`mic=${perms?.mic ? 'granted' : 'denied'} notif=${perms?.notifications ? 'granted' : 'denied'}`);
-    } catch (e: any) {
-      setPermStatus(`ERR ${e?.message || e}`);
-    }
-  }
-
-  async function startNative() {
-    setNativeStatus('starting');
-    try {
-      const t = (() => { try { return localStorage.getItem('uploadToken'); } catch { return null; }})();
-      if (t) await setUploadConfig((getUploadBase() || getApiBase() || ''), t);
-      const res = await startBackgroundRecording();
-      setNativeStatus(res.recording ? 'recording' : 'not-recording');
-    } catch (e: any) {
-      setNativeStatus(`ERR ${e?.message || e}`);
-    }
-  }
-
-  async function stopNative() {
-    try {
-      const res = await stopBackgroundRecording();
-      setNativeStatus(res.recording ? 'recording' : 'stopped');
-    } catch (e: any) {
-      setNativeStatus(`ERR ${e?.message || e}`);
-    }
-  }
-
-  async function nativeDebug3s() {
-    try {
-      const res = await debugTestRecord();
-      setNativeStatus(res.ok ? `debug ok: ${res.filePath || ''}` : 'debug failed');
-    } catch (e: any) {
-      setNativeStatus(`ERR ${e?.message || e}`);
-    }
-  }
+  // Android/native functions removed in web-only build
 
   async function refreshUploadToken() {
     try {
-      const res = await fetch(`${getApiBase() || ''}/api/auth/upload-token`, { method: 'POST', credentials: 'include' });
+      const res = await fetch(`${getApiBase() || ''}/api/auth/upload-token`, { method: 'POST', credentials: 'include', headers: { 'ngrok-skip-browser-warning': 'true' } });
       if (!res.ok) throw new Error(`${res.status}`);
       const { token } = await res.json();
       try { localStorage.setItem('uploadToken', token); } catch {}
@@ -178,6 +130,25 @@ export default function Diagnostics() {
       setApiBase('');
       setUploadBase('');
     } catch {}
+  }
+
+  function resetToDefault() {
+    try {
+      const envUrl = (import.meta as any).env?.VITE_API_BASE || (import.meta as any).env?.PUBLIC_URL || '';
+      const fallback = typeof window !== 'undefined' ? window.location.origin : '';
+      const url = (envUrl && String(envUrl)) || fallback;
+      if (url) {
+        localStorage.setItem('apiBase', url);
+        localStorage.setItem('uploadBase', url);
+        setApiBase(url);
+        setUploadBase(url);
+        alert('Reset API/Upload base to ' + url);
+      } else {
+        clearBases();
+      }
+    } catch {
+      clearBases();
+    }
   }
 
   return (
@@ -209,6 +180,7 @@ export default function Diagnostics() {
               <div className="mt-2 flex gap-2">
                 <Button size="sm" onClick={saveBases}>Save Overrides</Button>
                 <Button size="sm" variant="secondary" onClick={clearBases}>Clear Overrides</Button>
+                <Button size="sm" variant="outline" onClick={resetToDefault}>Reset to Default</Button>
               </div>
             </div>
             <div>Location Origin: {typeof window !== 'undefined' ? window.location.origin : ''}</div>
@@ -240,22 +212,8 @@ export default function Diagnostics() {
           <CardContent className="space-y-2 text-sm">
             <div className="flex gap-2 flex-wrap">
               <Button size="sm" onClick={testWebMic}>Web mic test (2s)</Button>
-              <Button size="sm" onClick={requestAndroidPerms}>Request Android perms</Button>
             </div>
             <div>Web mic: {micTest}</div>
-            <div>Android perms: {permStatus}</div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader><CardTitle>Native Recorder</CardTitle></CardHeader>
-          <CardContent className="space-y-2 text-sm">
-            <div className="flex gap-2 flex-wrap">
-              <Button size="sm" onClick={startNative}>Start native</Button>
-              <Button size="sm" variant="secondary" onClick={stopNative}>Stop native</Button>
-              <Button size="sm" onClick={nativeDebug3s}>Debug 3s record</Button>
-            </div>
-            <div>Status: {nativeStatus}</div>
           </CardContent>
         </Card>
       </div>

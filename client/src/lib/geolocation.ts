@@ -1,5 +1,3 @@
-import { Capacitor } from "@capacitor/core";
-import { Geolocation as CapGeolocation } from "@capacitor/geolocation";
 
 export interface LocationData {
   latitude: number;
@@ -8,27 +6,6 @@ export interface LocationData {
 }
 
 export async function getCurrentPosition(): Promise<LocationData> {
-  const isNative = Capacitor.isNativePlatform();
-  if (isNative) {
-    try {
-      const perm = await CapGeolocation.checkPermissions();
-      if (perm.location !== "granted") {
-        const req = await CapGeolocation.requestPermissions();
-        if (req.location !== "granted") {
-          throw new Error("Location permission denied");
-        }
-      }
-      const pos = await CapGeolocation.getCurrentPosition({ enableHighAccuracy: true, timeout: 10000 });
-      return {
-        latitude: pos.coords.latitude,
-        longitude: pos.coords.longitude,
-        accuracy: pos.coords.accuracy ?? 0,
-      };
-    } catch (err) {
-      // Fall back to browser API on error
-    }
-  }
-
   return new Promise((resolve, reject) => {
     if (!navigator.geolocation) {
       reject(new Error("Geolocation is not supported by this browser"));
@@ -80,9 +57,8 @@ export function calculateDistance(
 }
 
 export const SHOP_LOCATION = {
-  latitude: 29.379186,
-  longitude: 76.991095,
+  latitude: 29.394154,
+  longitude: 76.969757,
 } as const;
 
-export const MAX_DISTANCE = 15000; // meters - increased for testing
-
+export const MAX_DISTANCE = 100; // meters

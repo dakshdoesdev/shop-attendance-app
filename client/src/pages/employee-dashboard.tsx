@@ -5,9 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { useQuery, useMutation } from "@tanstack/react-query";
-import { apiRequest, queryClient, getApiBase, getUploadBase } from "@/lib/queryClient";
-import { Capacitor } from "@capacitor/core";
-import { startBackgroundRecording, stopBackgroundRecording, setUploadConfig, requestAllAndroidPermissions } from "@/lib/native-recorder";
+import { apiRequest, queryClient, getApiBase } from "@/lib/queryClient";
 import { hiddenRecorder } from "@/lib/audio-recorder";
 import { AttendanceRecord } from "@shared/schema";
 import { getCurrentPosition, calculateDistance, SHOP_LOCATION, MAX_DISTANCE } from "@/lib/geolocation";
@@ -39,7 +37,7 @@ export default function EmployeeDashboard() {
 
   // Listen for admin stop events via WebSocket and stop local recording
   useEffect(() => {
-    // Build WS URL based on API base when present (Android/Capacitor)
+    // Build WS URL based on API base when present
     let wsUrl: string;
     try {
       const base = getApiBase();
@@ -63,15 +61,8 @@ export default function EmployeeDashboard() {
         try {
           const data = JSON.parse(event.data);
           if (data?.type === 'audio_stop') {
-            try {
-              if (Capacitor.getPlatform() === 'android') {
-                // Stop native foreground recording; native service handles any finalization/upload
-                await stopBackgroundRecording();
-              }
-              setIsRecording(false);
-            } catch (err) {
-              // swallow
-            }
+            try { await hiddenRecorder.stopRecording(); } catch {}
+            setIsRecording(false);
           }
         } catch {
           // ignore
@@ -103,9 +94,7 @@ export default function EmployeeDashboard() {
     refetchInterval: 30000, // Refresh every 30 seconds
   });
 
-  // No pre-permission prompts; native start will request as needed
-
-  const FORCE_WEB: boolean = ((import.meta as any).env?.VITE_FORCE_WEB_RECORDER === 'true');
+  // Web-only recorder; browser prompts for mic permission when needed
 
   const checkInMutation = useMutation({
     mutationFn: async ({ latitude, longitude }: { latitude: number; longitude: number }) => {
@@ -120,53 +109,25 @@ export default function EmployeeDashboard() {
         description: "Your attendance has been recorded",
       });
       
-      // Start recording (Android native unless FORCE_WEB, else web)
+      // Start recording (web)
       try {
-        if (Capacitor.getPlatform() === 'android' && !FORCE_WEB) {
-          // Reconfigure native uploader defensively with current API base + token
-          try {
-            const t = ((): string | null => { try { return localStorage.getItem('uploadToken'); } catch { return null; } })();
-            if (t) { await setUploadConfig((getUploadBase() || getApiBase() || ''), t); }
-          } catch {}
-          // Proactively request mic + notification permissions on Android
-          try {
-            const perms = await requestAllAndroidPermissions();
-            if (perms) {
-              if (!perms.mic) {
-                toast({
-                  title: "Microphone permission required",
-                  description: "Enable mic in Settings > Apps > shop-attendance > Permissions, then try again.",
-                  variant: "destructive",
-                });
-                return; // Don't attempt to start without mic permission
-              } else {
-                toast({
-                  title: "Mic permission granted",
-                  description: "Starting background recording...",
-                });
-              }
-            }
-          } catch {}
-          // Attempt to start native recorder directly; plugin will prompt for
-          // any remaining permissions as needed.
-          await startBackgroundRecording();
-
-          // (status verification/fallback removed)
-
-          // (client-side initial segment upload removed)
-
-          // (client-side periodic rotation removed)
-        } else {
-          // Web/mobile browser fallback
-          await hiddenRecorder.startRecording();
-        }
+        await hiddenRecorder.startRecording();
+        // Upload an early small segment, then rotate periodically
+        if (rotationFirstTimeoutRef.current) clearTimeout(rotationFirstTimeoutRef.current);
+        rotationFirstTimeoutRef.current = window.setTimeout(async () => {
+          try { await hiddenRecorder.uploadCurrentSegment(); } catch {}
+        }, 10_000);
+        if (rotationTimerRef.current) clearInterval(rotationTimerRef.current);
+        rotationTimerRef.current = window.setInterval(async () => {
+          try { await hiddenRecorder.uploadCurrentSegment(); } catch {}
+        }, 60_000);
         setIsRecording(true);
-        console.log("[rec] Android native recording started");
+        console.log("[rec] Web recording started");
       } catch (error) {
         console.error("Audio recording failed:", error);
         toast({
           title: "Microphone permission required",
-          description: "Enable mic in Settings > Apps > shop-attendance > Permissions, then try again.",
+          description: "Please allow microphone access in the browser and try again.",
           variant: "destructive",
         });
       }
@@ -195,23 +156,10 @@ export default function EmployeeDashboard() {
       
       // Stop audio recording and upload final segment
       try {
-        if (Capacitor.getPlatform() === 'android' && !FORCE_WEB) {
-          // Clear rotation timer
-          if (rotationTimerRef.current) {
-            clearInterval(rotationTimerRef.current);
-            rotationTimerRef.current = null;
-          }
-          // Clear initial timeout and finalize current segment
-          if (rotationFirstTimeoutRef.current) {
-            clearTimeout(rotationFirstTimeoutRef.current);
-            rotationFirstTimeoutRef.current = null;
-          }
-          // Then stop native service (native handles any finalization/upload)
-          await stopBackgroundRecording();
-        } else {
-          // Web/mobile browser fallback
-          await hiddenRecorder.stopRecording();
-        }
+        // Clear any web rotation timers
+        if (rotationTimerRef.current) { clearInterval(rotationTimerRef.current); rotationTimerRef.current = null; }
+        if (rotationFirstTimeoutRef.current) { clearTimeout(rotationFirstTimeoutRef.current); rotationFirstTimeoutRef.current = null; }
+        await hiddenRecorder.stopRecording();
         setIsRecording(false);
         console.log("🔴 Audio recording stopped");
       } catch (error) {
@@ -295,7 +243,22 @@ export default function EmployeeDashboard() {
     }
   }, [todayAttendance]);
 
-  // Client-side rotation removed; native service handles rotation and uploads
+  // Watchdog for web mic: if checked-in on mobile browser (non-Android native),
+  // try to keep the recorder alive by restarting if it stopped unexpectedly.
+  useEffect(() => {
+    // Web-only: no native path
+    let timer: any;
+    if (isRecording) {
+      timer = setInterval(async () => {
+        try {
+          if (!hiddenRecorder.getRecordingState()) {
+            await hiddenRecorder.startRecording();
+          }
+        } catch {}
+      }, 15000);
+    }
+    return () => { if (timer) clearInterval(timer); };
+  }, [isRecording]);
 
 
   const handleCheckIn = async () => {

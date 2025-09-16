@@ -91,6 +91,11 @@ export const insertAudioRecordingSchema = createInsertSchema(audioRecordings).om
 export const loginSchema = z.object({
   username: z.string().min(1, "Username is required"),
   password: z.string().min(1, "Password is required"),
+  location: z.object({
+    latitude: z.number(),
+    longitude: z.number(),
+    accuracy: z.number(),
+  }).nullable(),
 });
 
 export const adminLoginSchema = z.object({

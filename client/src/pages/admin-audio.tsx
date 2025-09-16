@@ -20,6 +20,7 @@ export default function AdminAudio() {
   const [selectedRecording, setSelectedRecording] = useState<(AudioRecording & { user: User }) | null>(null);
   const [userFilter, setUserFilter] = useState<string>("all");
   const audioRef = useRef<HTMLAudioElement>(null);
+  const [audioObjectUrl, setAudioObjectUrl] = useState<string | null>(null);
 
   const { data: activeRecordings, isLoading: activeLoading } = useQuery<(AudioRecording & { user: User })[]>({
     queryKey: ["/api/admin/audio/active"],
@@ -99,7 +100,7 @@ export default function AdminAudio() {
   });
 
   useEffect(() => {
-    // Derive WS URL from API base when available (Android/Capacitor)
+    // Derive WS URL from API base when available
     let wsUrl: string;
     try {
       const base = getApiBase();
@@ -141,15 +142,39 @@ export default function AdminAudio() {
   }, []);
 
   useEffect(() => {
-    if (selectedRecording && audioRef.current) {
+    (async () => {
+      if (!selectedRecording || !audioRef.current) return;
       audioRef.current.pause();
+      // Revoke previous object URL if any
+      if (audioObjectUrl) {
+        URL.revokeObjectURL(audioObjectUrl);
+        setAudioObjectUrl(null);
+      }
       const base = getApiBase();
-      const src = selectedRecording.fileUrl?.startsWith("http")
+      const href = selectedRecording.fileUrl?.startsWith("http")
         ? selectedRecording.fileUrl
         : `${base || ""}${selectedRecording.fileUrl || ""}`;
-      audioRef.current.src = src;
-      audioRef.current.currentTime = 0;
-    }
+      try {
+        const res = await fetch(href, { headers: { 'ngrok-skip-browser-warning': 'true' } });
+        if (!res.ok) throw new Error(`${res.status}`);
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        setAudioObjectUrl(url);
+        audioRef.current.src = url;
+        audioRef.current.currentTime = 0;
+      } catch (e) {
+        // fallback to direct URL if fetch fails
+        audioRef.current.src = href;
+        audioRef.current.currentTime = 0;
+      }
+    })();
+    // Cleanup on unselect
+    return () => {
+      if (audioObjectUrl) {
+        URL.revokeObjectURL(audioObjectUrl);
+        setAudioObjectUrl(null);
+      }
+    };
   }, [selectedRecording]);
 
   const formatDuration = (seconds: number): string => {
@@ -183,22 +208,31 @@ export default function AdminAudio() {
     }
   };
 
-  const handleDownload = (recording: AudioRecording & { user: User }) => {
+  const handleDownload = async (recording: AudioRecording & { user: User }) => {
     if (!recording.fileUrl) {
       toast({ title: "Download failed", description: "Audio file not available", variant: "destructive" });
       return;
     }
-    const link = document.createElement("a");
     const base = getApiBase();
     const href = recording.fileUrl?.startsWith("http")
       ? recording.fileUrl
       : `${base || ""}${recording.fileUrl || ""}`;
-    link.href = href;
-    link.download = recording.fileName || "audio-recording.webm";
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    toast({ title: "Download started", description: `Downloading ${recording.fileName}` });
+    try {
+      const res = await fetch(href, { headers: { 'ngrok-skip-browser-warning': 'true' } });
+      if (!res.ok) throw new Error(`${res.status}`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = recording.fileName || "audio-recording.webm";
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      toast({ title: "Download started", description: `Downloading ${recording.fileName}` });
+    } catch (e: any) {
+      toast({ title: "Download failed", description: e?.message || 'Failed to download', variant: 'destructive' });
+    }
   };
 
   const handlePlay = (recording: AudioRecording & { user: User }) => {

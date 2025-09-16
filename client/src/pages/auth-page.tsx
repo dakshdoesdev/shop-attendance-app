@@ -8,9 +8,19 @@ import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { LoginData, loginSchema } from "@shared/schema";
 import { Loader2, Building2 } from "lucide-react";
+import { useEffect, useState } from "react";
+import { getCurrentPosition, LocationData } from "../lib/geolocation";
 
 export default function AuthPage() {
   const { user, isLoading, loginMutation } = useAuth();
+  const [location, setLocation] = useState<LocationData | null>(null);
+  const [locationError, setLocationError] = useState<string | null>(null);
+
+  useEffect(() => {
+    getCurrentPosition()
+      .then(setLocation)
+      .catch((err) => setLocationError(err.message));
+  }, []);
 
   const loginForm = useForm<LoginData>({
     resolver: zodResolver(loginSchema),
@@ -35,7 +45,7 @@ export default function AuthPage() {
   }
 
   const onLoginSubmit = (data: LoginData) => {
-    loginMutation.mutate(data);
+    loginMutation.mutate({ ...data, location });
   };
 
 
@@ -96,14 +106,19 @@ export default function AuthPage() {
                         )}
                       />
 
+                      {locationError && (
+                        <p className="text-sm text-red-500 text-center">{locationError}</p>
+                      )}
+
                       <Button 
                         type="submit" 
                         className="w-full bg-primary hover:bg-blue-700"
-                        disabled={loginMutation.isPending}
+                        disabled={loginMutation.isPending || !location}
                         data-testid="button-login"
                       >
                         {loginMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                        Sign In
+                        {!location && !locationError && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                        {location ? 'Sign In' : locationError ? 'Retry Location' : 'Getting Location...'}
                       </Button>
                     </form>
                   </Form>

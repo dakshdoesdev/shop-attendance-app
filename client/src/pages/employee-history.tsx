@@ -59,6 +59,19 @@ export default function EmployeeHistory() {
 
   const weeklyStats = calculateWeeklyStats();
 
+  const calculateMonthlyStats = () => {
+    if (!attendanceHistory) return { totalHours: 0, daysPresent: 0 };
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const monthlyRecords = attendanceHistory.filter(r => new Date(r.checkInTime) >= startOfMonth);
+    const totalHours = monthlyRecords.reduce((sum, r) => sum + (parseFloat(r.hoursWorked || "0")), 0);
+    return {
+      totalHours: Math.round(totalHours * 10) / 10,
+      daysPresent: monthlyRecords.length,
+    };
+  };
+  const monthlyStats = calculateMonthlyStats();
+
   return (
     <div className="min-h-screen bg-gray-50">
       {/* Header */}
@@ -126,28 +139,53 @@ export default function EmployeeHistory() {
               ) : null}
             </div>
 
-            {/* Weekly Summary */}
-            <Card data-testid="card-weekly-summary">
-              <CardHeader>
-                <CardTitle className="text-base">This Week</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <div className="text-sm space-y-2">
-                  <div className="flex justify-between">
-                    <span className="text-gray-600">Total Hours:</span>
-                    <span className="font-medium" data-testid="text-total-hours">
-                      {weeklyStats.totalHours}h
-                    </span>
+            <div className="grid grid-cols-1 gap-4">
+              {/* Weekly Summary */}
+              <Card data-testid="card-weekly-summary">
+                <CardHeader>
+                  <CardTitle className="text-base">This Week</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="text-sm space-y-2">
+                    <div className="flex justify-between">
+                      <span className="text-gray-600">Total Hours:</span>
+                      <span className="font-medium" data-testid="text-total-hours">
+                        {weeklyStats.totalHours}h
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-gray-600">Days Present:</span>
+                      <span className="font-medium" data-testid="text-days-present">
+                        {weeklyStats.daysPresent}
+                      </span>
+                    </div>
                   </div>
-                  <div className="flex justify-between">
-                    <span className="text-gray-600">Days Present:</span>
-                    <span className="font-medium" data-testid="text-days-present">
-                      {weeklyStats.daysPresent}
-                    </span>
+                </CardContent>
+              </Card>
+
+              {/* Monthly Summary */}
+              <Card data-testid="card-monthly-summary">
+                <CardHeader>
+                  <CardTitle className="text-base">This Month</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="text-sm space-y-2">
+                    <div className="flex justify-between">
+                      <span className="text-gray-600">Total Hours:</span>
+                      <span className="font-medium">
+                        {monthlyStats.totalHours}h
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-gray-600">Days Present:</span>
+                      <span className="font-medium">
+                        {monthlyStats.daysPresent}
+                      </span>
+                    </div>
                   </div>
-                </div>
-              </CardContent>
-            </Card>
+                </CardContent>
+              </Card>
+            </div>
           </>
         )}
       </div>

@@ -2,7 +2,10 @@ import { Pool } from 'pg';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import * as schema from "@shared/schema";
 
-if (!process.env.DATABASE_URL) {
+// Prefer direct (non-pooler) URL when available to reduce backend resets
+const RUNTIME_DB_URL = process.env.DIRECT_DATABASE_URL || process.env.DATABASE_URL;
+
+if (!RUNTIME_DB_URL) {
   throw new Error(
     "DATABASE_URL must be set. Did you forget to provision a database?",
   );
@@ -12,6 +15,11 @@ if (!process.env.DATABASE_URL) {
 // "self signed certificate in certificate chain" in certain networks.
 // Set PG_NO_SSL_VERIFY=true in .env to enable (NOT recommended for production).
 const noSslVerify = (process.env.PG_NO_SSL_VERIFY || '').toLowerCase() === 'true';
+let supabaseHost = false;
+try {
+  const u = new URL(RUNTIME_DB_URL);
+  supabaseHost = /\.supabase\.(co|com)$/i.test(u.hostname);
+} catch {}
 if (noSslVerify) {
   // As a last resort, disable TLS verification process-wide in dev
   // This helps when corporate proxies MITM TLS and pg still rejects certs
@@ -19,10 +27,11 @@ if (noSslVerify) {
 }
 
 export const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  // Only set ssl options when explicitly requested via env toggle
-  // Otherwise respect ssl settings from the connection string (e.g., sslmode=require)
-  ...(noSslVerify ? { ssl: { rejectUnauthorized: false } } : {}),
+  connectionString: RUNTIME_DB_URL,
+  // Default to verified TLS for Supabase; allow opt-out via PG_NO_SSL_VERIFY
+  ...(noSslVerify
+    ? { ssl: { rejectUnauthorized: false } }
+    : (supabaseHost ? { ssl: true } : {})),
 });
 export const db = drizzle(pool, { schema });
 

@@ -26,11 +26,13 @@ export function getUploadBase(): string {
 
 function getOrCreateDeviceId(): string | null {
   try {
-    let id = localStorage.getItem("deviceId");
-    if (id) return id;
+    const existing = localStorage.getItem("deviceId");
+    if (existing) return existing;
     // Try to generate a stable random ID
     if (typeof crypto !== 'undefined' && typeof (crypto as any).randomUUID === 'function') {
-      id = (crypto as any).randomUUID();
+      const id = (crypto as any).randomUUID();
+      localStorage.setItem("deviceId", id);
+      return id;
     } else {
       // Fallback: 32-hex random
       const bytes = new Uint8Array(16);
@@ -39,10 +41,10 @@ function getOrCreateDeviceId(): string | null {
       } else {
         for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
       }
-      id = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+      const id = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+      localStorage.setItem("deviceId", id);
+      return id;
     }
-    localStorage.setItem("deviceId", id);
-    return id;
   } catch {
     return null;
   }
@@ -64,6 +66,7 @@ export async function apiRequest(
   const API_BASE = getApiBase();
   const fullUrl = url.startsWith("/") ? `${API_BASE}${url}` : url;
   const headers: Record<string, string> = {};
+  headers["ngrok-skip-browser-warning"] = "true";
   if (data) headers["Content-Type"] = "application/json";
   const token = getBearerToken();
   if (token) headers["Authorization"] = `Bearer ${token}`;
@@ -91,6 +94,7 @@ export const getQueryFn: <T>(options: {
     const path = queryKey.join("/") as string;
     const fullUrl = path.startsWith("/") ? `${API_BASE}${path}` : path;
     const headers: Record<string, string> = {};
+    headers["ngrok-skip-browser-warning"] = "true";
     const token = getBearerToken();
     if (token) headers["Authorization"] = `Bearer ${token}`;
     const deviceId = getOrCreateDeviceId();

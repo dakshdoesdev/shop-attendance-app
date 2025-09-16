@@ -56,4 +56,3 @@ if (process.env.DATABASE_URL) {
   const mod = await import("./storage.memory");
   storage = mod.storage;
 }
-

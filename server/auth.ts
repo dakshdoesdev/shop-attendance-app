@@ -9,6 +9,7 @@ import { storage } from "./storage";
 import { getBoundDeviceId, bindDeviceId, unbindDeviceId } from "./device-lock";
 import { User as SelectUser, insertUserSchema } from "@shared/schema";
 import { z } from "zod";
+import { calculateDistance, MAX_DISTANCE, SHOP_LOCATION } from "./location";
 
 declare global {
   namespace Express {
@@ -53,6 +54,28 @@ async function comparePasswords(supplied: string, stored: string) {
 export function setupAuth(app: Express) {
   // Create test employee on startup
   createTestEmployee();
+  // Optionally bootstrap an admin account from env (no hardcoded admin)
+  (async () => {
+    try {
+      const adminUser = (process.env.ADMIN_USERNAME || '').trim();
+      const adminPass = (process.env.ADMIN_PASSWORD || '').trim();
+      if (adminUser && adminPass) {
+        const existing = await storage.getUserByUsername(adminUser);
+        if (!existing) {
+          const hashed = await hashPassword(adminPass);
+          await storage.createUser({
+            username: adminUser,
+            password: hashed,
+            role: 'admin',
+            department: 'Administration',
+          } as any);
+          console.log(`[auth] Bootstrap admin created: ${adminUser}`);
+        }
+      }
+    } catch (e) {
+      console.log('[auth] Bootstrap admin skipped:', (e as Error)?.message || e);
+    }
+  })();
 
   const corsEnabled = !!process.env.CORS_ORIGIN;
   const cookieSameSite = (process.env.COOKIE_SAMESITE as any) || (corsEnabled ? 'none' : 'lax');
@@ -97,7 +120,7 @@ export function setupAuth(app: Express) {
       const payload: any = jwt.verify(token, secret);
       if (!payload?.sub) return next();
       // Enforce device binding if configured
-      const deviceLock = (process.env.DEVICE_LOCK || 'true').toLowerCase() !== 'false';
+      const deviceLock = (process.env.DEVICE_LOCK || 'false').toLowerCase() !== 'false';
       const boundDid = deviceLock ? getBoundDeviceId(payload.sub) : undefined;
       const tokenDid = (payload as any).did as string | undefined;
       if (deviceLock && boundDid && tokenDid && boundDid !== tokenDid) {
@@ -147,8 +170,10 @@ export function setupAuth(app: Express) {
           joinDate: null,
           isActive: true,
           isLoggedIn: false,
+          defaultStartTime: null as any,
+          defaultEndTime: null as any,
           createdAt: null,
-        };
+        } as any;
         return done(null, adminUser);
       }
       
@@ -172,9 +197,27 @@ export function setupAuth(app: Express) {
         return res.status(401).json({ message: info?.message || "Invalid credentials" });
       }
 
+      // Location check for employees
+      const enforceLocation = (process.env.ENFORCE_LOCATION_CHECK || 'true').toLowerCase() !== 'false';
+      if (user.role === 'employee' && enforceLocation) {
+        const { location } = req.body;
+        if (!location) {
+          return res.status(401).json({ message: "Location data is missing" });
+        }
+        const distance = calculateDistance(
+          location.latitude,
+          location.longitude,
+          SHOP_LOCATION.latitude,
+          SHOP_LOCATION.longitude,
+        );
+        if (distance > MAX_DISTANCE) {
+          return res.status(401).json({ message: `You are too far from the shop. Distance: ${distance.toFixed(0)}m` });
+        }
+      }
+
       req.login(user, (err) => {
         if (err) return next(err);
-        const deviceLock = (process.env.DEVICE_LOCK || 'true').toLowerCase() !== 'false';
+        const deviceLock = (process.env.DEVICE_LOCK || 'false').toLowerCase() !== 'false';
         const deviceId = (req.headers['x-device-id'] as string) || (req.body?.deviceId as string) || undefined;
         try {
           if (deviceLock && deviceId) {
@@ -190,13 +233,11 @@ export function setupAuth(app: Express) {
         // Also issue a short-lived upload token to enable Android native uploads
         let token: string | undefined = undefined;
         try {
-          if (user.role === "employee") {
-            const secret = process.env.JWT_SECRET || "upload-secret-2025";
-            const expiresIn = process.env.JWT_EXPIRES_IN || "180d";
-            const payload: any = { sub: user.id, role: user.role };
-            if (deviceId) payload.did = deviceId;
-            token = jwt.sign(payload, secret, { expiresIn });
-          }
+          const secret = process.env.JWT_SECRET || "upload-secret-2025";
+          const expiresIn: any = process.env.JWT_EXPIRES_IN || "180d";
+          const payload: any = { sub: user.id, role: user.role };
+          if (deviceId) payload.did = deviceId;
+          token = jwt.sign(payload, secret, { expiresIn });
         } catch {}
         // Do not enforce or update an "already logged in" flag
         res.status(200).json({ ...user, token });
@@ -220,10 +261,10 @@ export function setupAuth(app: Express) {
   // Issue short-lived JWT for background/native uploads
   app.post("/api/auth/upload-token", (req, res) => {
     if (!req.isAuthenticated()) return res.sendStatus(401);
-    if (req.user?.role !== "employee") return res.status(403).json({ message: "Employee token only" });
+    // Token allowed for any logged-in user (admin or employee)
     const secret = process.env.JWT_SECRET || "upload-secret-2025";
-    const expiresIn = process.env.JWT_EXPIRES_IN || "180d";
-    const deviceLock = (process.env.DEVICE_LOCK || 'true').toLowerCase() !== 'false';
+    const expiresIn: any = process.env.JWT_EXPIRES_IN || "180d";
+    const deviceLock = (process.env.DEVICE_LOCK || 'false').toLowerCase() !== 'false';
     const deviceId = (req.headers['x-device-id'] as string) || undefined;
     if (deviceLock) {
       const bound = getBoundDeviceId(req.user.id);
@@ -238,39 +279,57 @@ export function setupAuth(app: Express) {
     res.json({ token });
   });
 
-  // Admin login endpoint
+  // Admin login endpoint (DB-backed; optional hardcoded toggle)
   app.post("/api/admin/login", async (req, res, next) => {
-    const { username, password, audioPassword } = req.body;
-    
+    const raw = req.body || {};
+    const uname = String(raw.username || '').trim();
+    const pword = String(raw.password || '');
+    const audioPassword = raw.audioPassword;
     try {
-      if (username !== "bediAdmin" || password !== "bediMain2025") {
-        return res.status(401).json({ message: "Invalid admin credentials" });
+      // Optional convenience: allow hardcoded admin when enabled
+      const allowHardcoded = (process.env.ALLOW_HARDCODED_ADMIN || '').toLowerCase() === 'true';
+      if (allowHardcoded) {
+        const hardUser = (process.env.HARDCODED_ADMIN_USERNAME || 'bediAdmin').trim();
+        const hardPass = (process.env.HARDCODED_ADMIN_PASSWORD || 'BediMain2025');
+        if (uname.toLowerCase() === hardUser.toLowerCase() && pword === hardPass) {
+          const adminUser: SelectUser = {
+            id: "admin-user",
+            username: hardUser,
+            password: "",
+            role: "admin",
+            employeeId: null,
+            department: null,
+            joinDate: null,
+            isActive: true,
+            isLoggedIn: false,
+            defaultStartTime: null as any,
+            defaultEndTime: null as any,
+            createdAt: null,
+          } as any;
+          return req.login(adminUser, (err) => {
+            if (err) return next(err);
+            const expected = process.env.AUDIO_ACCESS_PASSWORD || 'audioAccess2025';
+            if (audioPassword && audioPassword === expected) {
+              (req.session as any).audioAccess = true;
+              (req.session as any).audioAccessTime = Date.now();
+            }
+            return res.status(200).json(adminUser);
+          });
+        }
       }
 
-      // Create a mock admin user for session
-      const adminUser: SelectUser = {
-        id: "admin-user",
-        username: "bediAdmin",
-        password: "", // Don't store actual password
-        role: "admin",
-        employeeId: null,
-        department: null,
-        joinDate: null,
-        isActive: true,
-        isLoggedIn: false,
-        createdAt: null,
-      };
-
-      req.login(adminUser, (err) => {
+      const user = await storage.getUserByUsername(uname);
+      if (!user) return res.status(401).json({ message: "Invalid admin credentials" });
+      if (user.role !== 'admin') return res.status(403).json({ message: "Admin access required" });
+      const ok = await comparePasswords(pword, user.password);
+      if (!ok) return res.status(401).json({ message: "Invalid admin credentials" });
+      req.login(user, (err) => {
         if (err) return next(err);
-        
-        // Store audio access in session if provided
-        if (audioPassword === "audioAccess2025") {
+        if (audioPassword && (process.env.AUDIO_ACCESS_PASSWORD || 'audioAccess2025') === audioPassword) {
           (req.session as any).audioAccess = true;
           (req.session as any).audioAccessTime = Date.now();
         }
-        
-        res.status(200).json(adminUser);
+        res.status(200).json(user);
       });
     } catch (error) {
       next(error);
@@ -284,7 +343,8 @@ export function setupAuth(app: Express) {
     }
 
     const { audioPassword } = req.body;
-    if (audioPassword !== "audioAccess2025") {
+    const expected = process.env.AUDIO_ACCESS_PASSWORD || 'audioAccess2025';
+    if (audioPassword !== expected) {
       return res.status(401).json({ message: "Invalid audio access password" });
     }
 

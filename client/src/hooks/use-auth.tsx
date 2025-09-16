@@ -12,9 +12,7 @@ const adminLoginSchema = {
 };
 
 type AdminLoginData = typeof adminLoginSchema;
-import { getQueryFn, apiRequest, queryClient, getApiBase, getUploadBase } from "../lib/queryClient";
-import { setUploadConfig } from "@/lib/native-recorder";
-import { Capacitor } from "@capacitor/core";
+import { getQueryFn, apiRequest, queryClient } from "../lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { useEffect } from "react";
 
@@ -53,34 +51,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         title: "Login successful",
         description: `Welcome, ${user.username}!`,
       });
-      // Store bearer token if provided and configure native uploader
+      // Store bearer token if provided (web uploads use it when available)
       try {
         if (payload?.token) {
           localStorage.setItem("uploadToken", payload.token);
         }
       } catch {}
-      if (user.role === "employee" && Capacitor.getPlatform() === "android") {
-        (async () => {
-          try {
-            const token = ((): string | null => {
-              try { return localStorage.getItem("uploadToken"); } catch { return null; }
-            })();
-            if (token) {
-              await setUploadConfig((getUploadBase() || getApiBase() || ""), token);
-              return;
-            }
-          } catch {}
-          // Fallback to API-issued token when cookies are present
-          try {
-            const res = await apiRequest("POST", "/api/auth/upload-token");
-            const { token } = await res.json();
-            try { localStorage.setItem("uploadToken", token); } catch {}
-            await setUploadConfig((getUploadBase() || getApiBase() || ""), token);
-          } catch {
-            // non-fatal
-          }
-        })();
-      }
     },
     onError: (error: Error) => {
       toast({
@@ -91,31 +67,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     },
   });
 
-  // Ensure native uploader is configured when user is already logged in (app relaunch)
-  useEffect(() => {
-    (async () => {
-      if (!user) return;
-      if (user.role !== "employee") return;
-      if (Capacitor.getPlatform() !== "android") return;
-      try {
-        const token = ((): string | null => {
-          try { return localStorage.getItem("uploadToken"); } catch { return null; }
-        })();
-        if (token) {
-          await setUploadConfig((getUploadBase() || getApiBase() || ""), token);
-          return;
-        }
-      } catch {}
-      try {
-        const res = await apiRequest("POST", "/api/auth/upload-token");
-        const { token } = await res.json();
-        try { localStorage.setItem("uploadToken", token); } catch {}
-        await setUploadConfig((getUploadBase() || getApiBase() || ""), token);
-      } catch {
-        // non-fatal
-      }
-    })();
-  }, [user]);
+  // No native uploader configuration required in web-only build
 
 
   const adminLoginMutation = useMutation({

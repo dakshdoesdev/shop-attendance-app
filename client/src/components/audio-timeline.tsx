@@ -24,7 +24,7 @@ export function AudioTimeline({ fileUrl, startTime, duration, audioRef }: AudioT
       try {
         const base = getApiBase();
         const resolved = fileUrl?.startsWith("http") ? fileUrl : `${base || ""}${fileUrl || ""}`;
-        const res = await fetch(resolved);
+        const res = await fetch(resolved, { headers: { 'ngrok-skip-browser-warning': 'true' } });
         const arrayBuffer = await res.arrayBuffer();
         const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
         const audioCtx = new AudioCtx();

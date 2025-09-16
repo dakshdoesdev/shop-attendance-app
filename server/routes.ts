@@ -9,16 +9,29 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import jwt from "jsonwebtoken";
 import { dirname } from "path";
+import { spawn } from "child_process";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 
+// Resolve base directory for audio storage (override via AUDIO_UPLOAD_DIR)
+function getAudioBaseDir() {
+  const override = process.env.AUDIO_UPLOAD_DIR;
+  if (override && override.trim()) {
+    try { fs.mkdirSync(override, { recursive: true }); } catch {}
+    return override;
+  }
+  const def = path.join(__dirname, 'uploads', 'audio');
+  try { fs.mkdirSync(def, { recursive: true }); } catch {}
+  return def;
+}
+
 // Configure multer for audio file uploads
 const audioStorage = multer.diskStorage({
   destination: (req, file, cb) => {
     const userId = req.user?.id || 'unknown';
-    const uploadPath = path.join(__dirname, 'uploads', 'audio', userId);
+    const uploadPath = path.join(getAudioBaseDir(), userId);
     fs.mkdirSync(uploadPath, { recursive: true });
     cb(null, uploadPath);
   },
@@ -316,6 +329,27 @@ export function registerRoutes(app: Express, httpServer: Server) {
     }
   });
 
+  // Promote/demote a user role (admin only)
+  app.post("/api/admin/users/promote", async (req, res) => {
+    if (!req.isAuthenticated() || req.user?.role !== "admin") {
+      return res.status(401).json({ message: "Admin access required" });
+    }
+    try {
+      const { id, username, role } = req.body as { id?: string; username?: string; role?: 'admin' | 'employee' };
+      const targetRole: 'admin' | 'employee' = role === 'employee' ? 'employee' : 'admin';
+      if (!id && !username) {
+        return res.status(400).json({ message: "Provide user id or username" });
+      }
+      const user = id ? await storage.getUser(id) : await storage.getUserByUsername(String(username));
+      if (!user) return res.status(404).json({ message: "User not found" });
+      const updated = await storage.updateUser(user.id, { role: targetRole } as any);
+      return res.json(updated);
+    } catch (error) {
+      console.error('Promote user error:', error);
+      return res.status(500).json({ message: "Failed to update user role" });
+    }
+  });
+
   app.post("/api/admin/employees", async (req, res) => {
     if (!req.isAuthenticated() || req.user?.role !== "admin") {
       return res.status(401).json({ message: "Admin access required" });
@@ -461,28 +495,151 @@ export function registerRoutes(app: Express, httpServer: Server) {
         return res.status(400).json({ message: "No attendance record found" });
       }
 
-      const fileUrl = `/uploads/audio/${userId}/${file.filename}`;
+      const segmentPath = (file as any).path ? path.resolve((file as any).path) : path.join(getAudioBaseDir(), userId, file.filename);
+      const uploadDir = path.dirname(segmentPath);
+      const masterName = `daily-${today}.m4a`;
+      const masterPath = path.join(uploadDir, masterName);
 
-      // Always create a new segment record; keep active session separate
-      const clientDuration = req.body.duration ? parseInt(req.body.duration, 10) : undefined;
-      const durationSeconds = clientDuration !== undefined ? clientDuration : 0;
-
-      const savedRecording = await storage.createAudioRecording({
-        userId,
-        attendanceId: attendanceRecord.id,
-        fileUrl,
-        fileName: file.filename,
-        fileSize: file.size,
-        duration: durationSeconds,
-        recordingDate: today,
-        isActive: false,
+      const resolvedFfmpeg = async (): Promise<string> => {
+        if (process.env.FFMPEG_BIN && process.env.FFMPEG_BIN.trim()) return process.env.FFMPEG_BIN;
+        try {
+          const mod: any = await import('ffmpeg-static');
+          if (mod?.default) return mod.default as string;
+        } catch {}
+        return 'ffmpeg';
+      };
+      const runFfmpeg = async (args: string[]) => new Promise<void>(async (resolve, reject) => {
+        const bin = await resolvedFfmpeg();
+        const p = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+        let stderr = '';
+        p.stderr.on('data', (d) => { stderr += d.toString(); });
+        p.on('close', (code) => {
+          if (code === 0) resolve(); else reject(new Error(stderr || `ffmpeg exited ${code}`));
+        });
       });
+
+      const clientDuration = req.body.duration ? parseInt(req.body.duration, 10) : undefined;
+      const segDur = clientDuration !== undefined ? clientDuration : 0;
+
+      // Calculate expected timeline length from check-in to now
+      const expectedTimelineSec = Math.max(0, Math.floor((Date.now() - new Date(attendanceRecord.checkInTime).getTime()) / 1000));
+
+      let newDurationSec = 0;
+      let finalFileSize = 0;
+      let finalFileUrl = `/uploads/audio/${userId}/${masterName}`;
+      let savedRecording: any = null;
+
+      try {
+        const hasMaster = fs.existsSync(masterPath);
+        const existing = await storage.getAudioRecordingByUserAndDate(userId, today);
+        const existingDuration = existing?.duration ? (typeof existing.duration === 'number' ? existing.duration : parseInt(String(existing.duration), 10) || 0) : 0;
+        const gapSec = Math.max(0, expectedTimelineSec - (existingDuration + segDur));
+
+        const tmpOut = path.join(uploadDir, `daily-${today}-${Date.now()}.m4a`);
+        const silencePath = path.join(uploadDir, `silence-${Date.now()}.m4a`);
+
+        // Helper to create silence file
+        const makeSilence = async (seconds: number) => {
+          if (seconds <= 0) return false;
+          await runFfmpeg(['-f','lavfi','-t', String(seconds), '-i','anullsrc=channel_layout=mono:sample_rate=48000', '-c:a','aac','-b:a','96k', silencePath]);
+          return true;
+        };
+
+        if (!hasMaster) {
+          if (gapSec > 0) {
+            await makeSilence(gapSec);
+            await runFfmpeg(['-i', silencePath, '-i', segmentPath, '-filter_complex','[0:a][1:a]concat=n=2:v=0:a=1[a]','-map','[a]','-c:a','aac','-b:a','96k', tmpOut]);
+            try { await fs.promises.unlink(silencePath); } catch {}
+          } else {
+            // Transcode first segment to normalized AAC
+            await runFfmpeg(['-i', segmentPath, '-c:a','aac','-b:a','96k', tmpOut]);
+          }
+        } else {
+          // Build concat of master + optional silence + new segment
+          if (gapSec > 0) {
+            await makeSilence(gapSec);
+            await runFfmpeg(['-i', masterPath, '-i', silencePath, '-i', segmentPath, '-filter_complex','[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]','-map','[a]','-c:a','aac','-b:a','96k', tmpOut]);
+            try { await fs.promises.unlink(silencePath); } catch {}
+          } else {
+            await runFfmpeg(['-i', masterPath, '-i', segmentPath, '-filter_complex','[0:a][1:a]concat=n=2:v=0:a=1[a]','-map','[a]','-c:a','aac','-b:a','96k', tmpOut]);
+          }
+        }
+
+        // Replace master with tmpOut
+        await fs.promises.rename(tmpOut, masterPath);
+        // Cleanup uploaded raw segment to save space
+        try { await fs.promises.unlink(segmentPath); } catch {}
+
+        const stat = fs.statSync(masterPath);
+        finalFileSize = stat.size;
+        newDurationSec = expectedTimelineSec; // master matches timeline up to now
+
+        // Update or create DB record pointing to master file
+        if (existing) {
+          savedRecording = await storage.updateAudioRecording(existing.id, {
+            attendanceId: attendanceRecord.id,
+            fileUrl: finalFileUrl,
+            fileName: masterName,
+            fileSize: finalFileSize,
+            duration: newDurationSec,
+            recordingDate: today,
+            isActive: false,
+          });
+        } else {
+          savedRecording = await storage.createAudioRecording({
+            userId,
+            attendanceId: attendanceRecord.id,
+            fileUrl: finalFileUrl,
+            fileName: masterName,
+            fileSize: finalFileSize,
+            duration: newDurationSec,
+            recordingDate: today,
+            isActive: false,
+          });
+        }
+      } catch (mergeErr) {
+        console.warn('ffmpeg merge failed, falling back to last file only:', mergeErr);
+        // Fallback: keep just the latest file as the day's file
+        try {
+          await fs.promises.rename(segmentPath, masterPath);
+        } catch {
+          // if rename fails due to existing, overwrite
+          await fs.promises.copyFile(segmentPath, masterPath);
+          try { await fs.promises.unlink(segmentPath); } catch {}
+        }
+        const stat = fs.statSync(masterPath);
+        finalFileSize = stat.size;
+        newDurationSec = segDur;
+        const existing = await storage.getAudioRecordingByUserAndDate(userId, today);
+        if (existing) {
+          savedRecording = await storage.updateAudioRecording(existing.id, {
+            attendanceId: attendanceRecord.id,
+            fileUrl: finalFileUrl,
+            fileName: masterName,
+            fileSize: finalFileSize,
+            duration: (typeof existing.duration === 'number' ? existing.duration : parseInt(String(existing.duration || 0), 10) || 0) + segDur,
+            recordingDate: today,
+            isActive: false,
+          });
+        } else {
+          savedRecording = await storage.createAudioRecording({
+            userId,
+            attendanceId: attendanceRecord.id,
+            fileUrl: finalFileUrl,
+            fileName: masterName,
+            fileSize: finalFileSize,
+            duration: newDurationSec,
+            recordingDate: today,
+            isActive: false,
+          });
+        }
+      }
 
       await storage.enforceAudioStorageLimit(30 * 1024 * 1024 * 1024);
       // Also enforce 15-day retention on upload
       await storage.deleteOldAudioRecordings(15);
 
-      console.log(`✅ Audio segment saved: ${savedRecording?.id}`);
+      console.log(`merge ok: ${masterName} (${finalFileSize} bytes) :: ${savedRecording?.id || ''}`);
       res.json({ message: "Audio uploaded successfully", recording: savedRecording });
     } catch (error) {
       console.error('Audio upload error:', error);
@@ -493,7 +650,7 @@ export function registerRoutes(app: Express, httpServer: Server) {
   // Serve audio files (with proper Content-Type and HTTP Range support)
   app.get("/uploads/audio/:userId/:filename", (req, res) => {
     const { userId, filename } = req.params as { userId: string; filename: string };
-    const filePath = path.join(__dirname, 'uploads', 'audio', userId, filename);
+    const filePath = path.join(getAudioBaseDir(), userId, filename);
 
     if (!fs.existsSync(filePath)) {
       return res.status(404).json({ message: "Audio file not found" });
@@ -533,6 +690,82 @@ export function registerRoutes(app: Express, httpServer: Server) {
         'Content-Type': contentType,
       });
       fs.createReadStream(filePath).pipe(res);
+    }
+  });
+
+  // Quick create employee: minimal input (name + time range + optional password)
+  app.post("/api/admin/employees/quick", async (req, res) => {
+    if (!req.isAuthenticated() || req.user?.role !== "admin") {
+      return res.status(401).json({ message: "Admin access required" });
+    }
+
+    try {
+      const { name, username, time, password } = req.body as { name?: string; username?: string; time?: string; password?: string };
+      const uname = (username || name || "").trim();
+      if (!uname) return res.status(400).json({ message: "Provide name or username" });
+
+      const toHHMM = (h: number, m: number): string => {
+        const hh = String(Math.max(0, Math.min(23, h))).padStart(2, '0');
+        const mm = String(Math.max(0, Math.min(59, m))).padStart(2, '0');
+        return `${hh}:${mm}`;
+      };
+
+      const parseTimeToken = (tok: string, fallbackAm?: boolean): { h: number; m: number } | null => {
+        tok = tok.trim().toLowerCase();
+        let ampm: 'am' | 'pm' | undefined = undefined;
+        if (tok.endsWith('am')) { ampm = 'am'; tok = tok.slice(0, -2); }
+        else if (tok.endsWith('pm')) { ampm = 'pm'; tok = tok.slice(0, -2); }
+        tok = tok.replace(/[^0-9:]/g, '');
+        if (!tok) return null;
+        let h = 0, m = 0;
+        if (tok.includes(':')) {
+          const [hs, ms] = tok.split(':');
+          h = parseInt(hs || '0', 10); m = parseInt(ms || '0', 10) || 0;
+        } else {
+          h = parseInt(tok, 10); m = 0;
+        }
+        if (isNaN(h) || isNaN(m)) return null;
+        if (ampm === 'am') { if (h === 12) h = 0; }
+        else if (ampm === 'pm') { if (h < 12) h += 12; }
+        else if (fallbackAm === true) { if (h === 12) h = 0; }
+        return { h, m };
+      };
+
+      const parseTimeRange = (range?: string): { start?: string; end?: string } => {
+        if (!range) return {};
+        const sep = range.includes(' to ') ? ' to ' : (range.includes('-') ? '-' : (range.includes('–') ? '–' : ' to '));
+        const parts = range.split(sep);
+        const left = (parts[0] || '').trim();
+        const right = (parts[1] || '').trim();
+        // infer AM on start if end contains pm
+        const endHasPm = /pm\b/i.test(right);
+        const t1 = parseTimeToken(left, endHasPm ? true : undefined);
+        const t2 = parseTimeToken(right);
+        const out: any = {};
+        if (t1) out.start = toHHMM(t1.h, t1.m);
+        if (t2) out.end = toHHMM(t2.h, t2.m);
+        return out;
+      };
+
+      const { start, end } = parseTimeRange(time);
+      const pwd = (password && String(password)) || '123456';
+
+      const existing = await storage.getUserByUsername(uname);
+      if (existing) return res.status(409).json({ message: "Username already exists" });
+
+      const hashed = await hashPassword(pwd);
+      const user = await storage.createUser({
+        username: uname,
+        password: hashed,
+        role: 'employee',
+        defaultStartTime: start,
+        defaultEndTime: end,
+      } as any);
+
+      return res.status(201).json(user);
+    } catch (error) {
+      console.error('Quick create employee error:', error);
+      return res.status(500).json({ message: "Failed to create employee" });
     }
   });
 

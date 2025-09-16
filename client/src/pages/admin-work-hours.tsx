@@ -38,6 +38,23 @@ export default function AdminWorkHours() {
     enabled: !!selectedMonth,
   });
 
+  // Sorting
+  const [sortKey, setSortKey] = useState<'hours' | 'name'>('hours');
+  const [sortDir, setSortDir] = useState<'desc' | 'asc'>('desc');
+  const sortedEmployees = useMemo(() => {
+    const list = workHoursData?.employees ? [...workHoursData.employees] : [];
+    list.sort((a, b) => {
+      let cmp = 0;
+      if (sortKey === 'hours') {
+        cmp = (a.totalHours - b.totalHours);
+      } else {
+        cmp = a.username.localeCompare(b.username);
+      }
+      return sortDir === 'asc' ? cmp : -cmp;
+    });
+    return list;
+  }, [workHoursData, sortKey, sortDir]);
+
   // Generate month options for recent months only (current and last 2)
   const monthOptions = useMemo(() => {
     const options = [];
@@ -137,7 +154,7 @@ export default function AdminWorkHours() {
               </div>
             </div>
             
-            {/* Month Selector */}
+            {/* Month + Sort Controls */}
             <div className="flex items-center space-x-4">
               <div className="flex items-center space-x-2">
                 <Calendar className="h-4 w-4 text-gray-500" />
@@ -151,6 +168,27 @@ export default function AdminWorkHours() {
                         {option.label}
                       </SelectItem>
                     ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="flex items-center space-x-2">
+                <span className="text-sm text-gray-600">Sort:</span>
+                <Select value={sortKey} onValueChange={(v: any) => setSortKey(v)}>
+                  <SelectTrigger className="w-32">
+                    <SelectValue placeholder="Sort By" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="hours">Total Hours</SelectItem>
+                    <SelectItem value="name">Name</SelectItem>
+                  </SelectContent>
+                </Select>
+                <Select value={sortDir} onValueChange={(v: any) => setSortDir(v)}>
+                  <SelectTrigger className="w-28">
+                    <SelectValue placeholder="Order" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="desc">High → Low</SelectItem>
+                    <SelectItem value="asc">Low → High</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
@@ -235,7 +273,7 @@ export default function AdminWorkHours() {
         {/* Employee Work Hours Tables */}
         {workHoursData?.employees && workHoursData.employees.length > 0 && (
           <div className="space-y-8">
-            {workHoursData.employees.map((employee) => (
+            {sortedEmployees.map((employee) => (
               <Card key={employee.userId} className="overflow-hidden">
                 <CardHeader className="bg-gray-50 border-b">
                   <div className="flex justify-between items-start">

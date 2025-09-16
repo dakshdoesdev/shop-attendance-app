@@ -43,6 +43,9 @@ var init_schema = __esm({
       joinDate: timestamp("join_date").defaultNow(),
       isActive: boolean("is_active").default(true),
       isLoggedIn: boolean("is_logged_in").default(false),
+      // Optional default work hours per employee in HH:MM 24h format
+      defaultStartTime: text("default_start_time"),
+      defaultEndTime: text("default_end_time"),
       createdAt: timestamp("created_at").defaultNow()
     });
     attendanceRecords = pgTable("attendance_records", {
@@ -140,28 +143,40 @@ async function ensureDbReady(retries = 10, delayMs = 1500) {
     }
   }
 }
-var noSslVerify, pool, db;
+var RUNTIME_DB_URL, noSslVerify, supabaseHost, pool, db;
 var init_db = __esm({
   "server/db.ts"() {
     "use strict";
     init_schema();
-    if (!process.env.DATABASE_URL) {
+    RUNTIME_DB_URL = process.env.DIRECT_DATABASE_URL || process.env.DATABASE_URL;
+    if (!RUNTIME_DB_URL) {
       throw new Error(
         "DATABASE_URL must be set. Did you forget to provision a database?"
       );
     }
     noSslVerify = (process.env.PG_NO_SSL_VERIFY || "").toLowerCase() === "true";
+    supabaseHost = false;
+    try {
+      const u = new URL(RUNTIME_DB_URL);
+      supabaseHost = /\.supabase\.(co|com)$/i.test(u.hostname);
+    } catch {
+    }
     if (noSslVerify) {
       process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
     }
     pool = new Pool({
-      connectionString: process.env.DATABASE_URL,
-      // Only set ssl options when explicitly requested via env toggle
-      // Otherwise respect ssl settings from the connection string (e.g., sslmode=require)
-      ...noSslVerify ? { ssl: { rejectUnauthorized: false } } : {}
+      connectionString: RUNTIME_DB_URL,
+      // Default to verified TLS for Supabase; allow opt-out via PG_NO_SSL_VERIFY
+      ...noSslVerify ? { ssl: { rejectUnauthorized: false } } : supabaseHost ? { ssl: true } : {}
     });
     db = drizzle(pool, { schema: schema_exports });
     pool.on("error", (err) => {
+      const msg = String(err?.message || err || "");
+      const code = err && err.code || "";
+      if (code === "XX000" || msg.includes("db_termination") || msg.includes("{:shutdown")) {
+        console.warn("Postgres connection closed by server (likely pooled backend). Will reconnect on next query.");
+        return;
+      }
       console.error("Unexpected Postgres pool error. Will retry on next query:", err);
     });
   }
@@ -177,14 +192,17 @@ import { eq, desc, and, sql as sql2 } from "drizzle-orm";
 import session from "express-session";
 import connectPg from "connect-pg-simple";
 import fs from "fs";
-import path from "path";
-var PostgresSessionStore, DatabaseStorage, storage;
+import path, { dirname } from "path";
+import { fileURLToPath } from "url";
+var PostgresSessionStore, __filename, __dirname, DatabaseStorage, storage;
 var init_storage_db = __esm({
   "server/storage.db.ts"() {
     "use strict";
     init_schema();
     init_db();
     PostgresSessionStore = connectPg(session);
+    __filename = fileURLToPath(import.meta.url);
+    __dirname = dirname(__filename);
     DatabaseStorage = class {
       sessionStore;
       constructor() {
@@ -628,7 +646,6 @@ var init_storage_memory = __esm({
 // server/index.ts
 import "dotenv/config";
 import express2 from "express";
-import cors from "cors";
 
 // server/routes.ts
 import { WebSocketServer, WebSocket } from "ws";
@@ -721,6 +738,27 @@ async function comparePasswords(supplied, stored) {
 }
 function setupAuth(app2) {
   createTestEmployee();
+  (async () => {
+    try {
+      const adminUser = (process.env.ADMIN_USERNAME || "").trim();
+      const adminPass = (process.env.ADMIN_PASSWORD || "").trim();
+      if (adminUser && adminPass) {
+        const existing = await storage3.getUserByUsername(adminUser);
+        if (!existing) {
+          const hashed = await hashPassword(adminPass);
+          await storage3.createUser({
+            username: adminUser,
+            password: hashed,
+            role: "admin",
+            department: "Administration"
+          });
+          console.log(`[auth] Bootstrap admin created: ${adminUser}`);
+        }
+      }
+    } catch (e) {
+      console.log("[auth] Bootstrap admin skipped:", e?.message || e);
+    }
+  })();
   const corsEnabled = !!process.env.CORS_ORIGIN;
   const cookieSameSite = process.env.COOKIE_SAMESITE || (corsEnabled ? "none" : "lax");
   const cookieSecure = process.env.COOKIE_SECURE === "true" || cookieSameSite === "none" || process.env.NODE_ENV === "production";
@@ -754,7 +792,7 @@ function setupAuth(app2) {
       const secret = process.env.JWT_SECRET || "upload-secret-2025";
       const payload = jwt.verify(token, secret);
       if (!payload?.sub) return next();
-      const deviceLock = (process.env.DEVICE_LOCK || "true").toLowerCase() !== "false";
+      const deviceLock = (process.env.DEVICE_LOCK || "false").toLowerCase() !== "false";
       const boundDid = deviceLock ? getBoundDeviceId(payload.sub) : void 0;
       const tokenDid = payload.did;
       if (deviceLock && boundDid && tokenDid && boundDid !== tokenDid) {
@@ -797,6 +835,8 @@ function setupAuth(app2) {
           joinDate: null,
           isActive: true,
           isLoggedIn: false,
+          defaultStartTime: null,
+          defaultEndTime: null,
           createdAt: null
         };
         return done(null, adminUser);
@@ -819,7 +859,7 @@ function setupAuth(app2) {
       }
       req.login(user, (err2) => {
         if (err2) return next(err2);
-        const deviceLock = (process.env.DEVICE_LOCK || "true").toLowerCase() !== "false";
+        const deviceLock = (process.env.DEVICE_LOCK || "false").toLowerCase() !== "false";
         const deviceId = req.headers["x-device-id"] || req.body?.deviceId || void 0;
         try {
           if (deviceLock && deviceId) {
@@ -835,13 +875,11 @@ function setupAuth(app2) {
         }
         let token = void 0;
         try {
-          if (user.role === "employee") {
-            const secret = process.env.JWT_SECRET || "upload-secret-2025";
-            const expiresIn = process.env.JWT_EXPIRES_IN || "180d";
-            const payload = { sub: user.id, role: user.role };
-            if (deviceId) payload.did = deviceId;
-            token = jwt.sign(payload, secret, { expiresIn });
-          }
+          const secret = process.env.JWT_SECRET || "upload-secret-2025";
+          const expiresIn = process.env.JWT_EXPIRES_IN || "180d";
+          const payload = { sub: user.id, role: user.role };
+          if (deviceId) payload.did = deviceId;
+          token = jwt.sign(payload, secret, { expiresIn });
         } catch {
         }
         res.status(200).json({ ...user, token });
@@ -861,10 +899,9 @@ function setupAuth(app2) {
   });
   app2.post("/api/auth/upload-token", (req, res) => {
     if (!req.isAuthenticated()) return res.sendStatus(401);
-    if (req.user?.role !== "employee") return res.status(403).json({ message: "Employee token only" });
     const secret = process.env.JWT_SECRET || "upload-secret-2025";
     const expiresIn = process.env.JWT_EXPIRES_IN || "180d";
-    const deviceLock = (process.env.DEVICE_LOCK || "true").toLowerCase() !== "false";
+    const deviceLock = (process.env.DEVICE_LOCK || "false").toLowerCase() !== "false";
     const deviceId = req.headers["x-device-id"] || void 0;
     if (deviceLock) {
       const bound = getBoundDeviceId(req.user.id);
@@ -879,31 +916,53 @@ function setupAuth(app2) {
     res.json({ token });
   });
   app2.post("/api/admin/login", async (req, res, next) => {
-    const { username, password, audioPassword } = req.body;
+    const raw = req.body || {};
+    const uname = String(raw.username || "").trim();
+    const pword = String(raw.password || "");
+    const audioPassword = raw.audioPassword;
     try {
-      if (username !== "bediAdmin" || password !== "bediMain2025") {
-        return res.status(401).json({ message: "Invalid admin credentials" });
+      const allowHardcoded = (process.env.ALLOW_HARDCODED_ADMIN || "").toLowerCase() === "true";
+      if (allowHardcoded) {
+        const hardUser = (process.env.HARDCODED_ADMIN_USERNAME || "bediAdmin").trim();
+        const hardPass = process.env.HARDCODED_ADMIN_PASSWORD || "BediMain2025";
+        if (uname.toLowerCase() === hardUser.toLowerCase() && pword === hardPass) {
+          const adminUser = {
+            id: "admin-user",
+            username: hardUser,
+            password: "",
+            role: "admin",
+            employeeId: null,
+            department: null,
+            joinDate: null,
+            isActive: true,
+            isLoggedIn: false,
+            defaultStartTime: null,
+            defaultEndTime: null,
+            createdAt: null
+          };
+          return req.login(adminUser, (err) => {
+            if (err) return next(err);
+            const expected = process.env.AUDIO_ACCESS_PASSWORD || "audioAccess2025";
+            if (audioPassword && audioPassword === expected) {
+              req.session.audioAccess = true;
+              req.session.audioAccessTime = Date.now();
+            }
+            return res.status(200).json(adminUser);
+          });
+        }
       }
-      const adminUser = {
-        id: "admin-user",
-        username: "bediAdmin",
-        password: "",
-        // Don't store actual password
-        role: "admin",
-        employeeId: null,
-        department: null,
-        joinDate: null,
-        isActive: true,
-        isLoggedIn: false,
-        createdAt: null
-      };
-      req.login(adminUser, (err) => {
+      const user = await storage3.getUserByUsername(uname);
+      if (!user) return res.status(401).json({ message: "Invalid admin credentials" });
+      if (user.role !== "admin") return res.status(403).json({ message: "Admin access required" });
+      const ok = await comparePasswords(pword, user.password);
+      if (!ok) return res.status(401).json({ message: "Invalid admin credentials" });
+      req.login(user, (err) => {
         if (err) return next(err);
-        if (audioPassword === "audioAccess2025") {
+        if (audioPassword && (process.env.AUDIO_ACCESS_PASSWORD || "audioAccess2025") === audioPassword) {
           req.session.audioAccess = true;
           req.session.audioAccessTime = Date.now();
         }
-        res.status(200).json(adminUser);
+        res.status(200).json(user);
       });
     } catch (error) {
       next(error);
@@ -914,7 +973,8 @@ function setupAuth(app2) {
       return res.status(401).json({ message: "Admin access required" });
     }
     const { audioPassword } = req.body;
-    if (audioPassword !== "audioAccess2025") {
+    const expected = process.env.AUDIO_ACCESS_PASSWORD || "audioAccess2025";
+    if (audioPassword !== expected) {
       return res.status(401).json({ message: "Invalid audio access password" });
     }
     req.session.audioAccess = true;
@@ -953,15 +1013,32 @@ function setupAuth(app2) {
 import multer from "multer";
 import path3 from "path";
 import fs3 from "fs";
-import { fileURLToPath } from "url";
+import { fileURLToPath as fileURLToPath2 } from "url";
 import jwt2 from "jsonwebtoken";
-import { dirname } from "path";
-var __filename = fileURLToPath(import.meta.url);
-var __dirname2 = dirname(__filename);
+import { dirname as dirname2 } from "path";
+import { spawn } from "child_process";
+var __filename2 = fileURLToPath2(import.meta.url);
+var __dirname2 = dirname2(__filename2);
+function getAudioBaseDir() {
+  const override = process.env.AUDIO_UPLOAD_DIR;
+  if (override && override.trim()) {
+    try {
+      fs3.mkdirSync(override, { recursive: true });
+    } catch {
+    }
+    return override;
+  }
+  const def = path3.join(__dirname2, "uploads", "audio");
+  try {
+    fs3.mkdirSync(def, { recursive: true });
+  } catch {
+  }
+  return def;
+}
 var audioStorage = multer.diskStorage({
   destination: (req, file, cb) => {
     const userId = req.user?.id || "unknown";
-    const uploadPath = path3.join(__dirname2, "uploads", "audio", userId);
+    const uploadPath = path3.join(getAudioBaseDir(), userId);
     fs3.mkdirSync(uploadPath, { recursive: true });
     cb(null, uploadPath);
   },
@@ -1033,7 +1110,10 @@ function registerRoutes(app2, httpServer) {
       }
       console.log(`\u2705 Check-in allowed from anywhere - Location: ${latitude}, ${longitude}`);
       const checkInTime = /* @__PURE__ */ new Date();
-      const isLate = checkInTime.getHours() > 9 || checkInTime.getHours() === 9 && checkInTime.getMinutes() > 15;
+      const user = await storage3.getUser(userId);
+      const expectedStart = user?.defaultStartTime && typeof user.defaultStartTime === "string" ? user.defaultStartTime : "09:15";
+      const [sh, sm] = expectedStart.split(":").map((v) => parseInt(v, 10));
+      const isLate = checkInTime.getHours() > (sh || 9) || checkInTime.getHours() === (sh || 9) && checkInTime.getMinutes() > (sm || 15);
       const attendanceRecord = await storage3.createAttendanceRecord({
         userId,
         checkInTime,
@@ -1072,7 +1152,10 @@ function registerRoutes(app2, httpServer) {
         return res.status(400).json({ message: "No active check-in found" });
       }
       const checkOutTime = /* @__PURE__ */ new Date();
-      const isEarlyLeave = checkOutTime.getHours() < 21 || checkOutTime.getHours() === 21 && checkOutTime.getMinutes() < 0;
+      const user = await storage3.getUser(userId);
+      const expectedEnd = user?.defaultEndTime && typeof user.defaultEndTime === "string" ? user.defaultEndTime : "21:00";
+      const [eh, em] = expectedEnd.split(":").map((v) => parseInt(v, 10));
+      const isEarlyLeave = checkOutTime.getHours() < (eh || 21) || checkOutTime.getHours() === (eh || 21) && checkOutTime.getMinutes() < (em || 0);
       const hoursWorked = (checkOutTime.getTime() - existingRecord.checkInTime.getTime()) / (1e3 * 60 * 60);
       const updatedRecord = await storage3.updateAttendanceRecord(existingRecord.id, {
         checkOutTime,
@@ -1197,12 +1280,31 @@ function registerRoutes(app2, httpServer) {
       res.status(500).json({ message: "Failed to fetch employees" });
     }
   });
+  app2.post("/api/admin/users/promote", async (req, res) => {
+    if (!req.isAuthenticated() || req.user?.role !== "admin") {
+      return res.status(401).json({ message: "Admin access required" });
+    }
+    try {
+      const { id, username, role } = req.body;
+      const targetRole = role === "employee" ? "employee" : "admin";
+      if (!id && !username) {
+        return res.status(400).json({ message: "Provide user id or username" });
+      }
+      const user = id ? await storage3.getUser(id) : await storage3.getUserByUsername(String(username));
+      if (!user) return res.status(404).json({ message: "User not found" });
+      const updated = await storage3.updateUser(user.id, { role: targetRole });
+      return res.json(updated);
+    } catch (error) {
+      console.error("Promote user error:", error);
+      return res.status(500).json({ message: "Failed to update user role" });
+    }
+  });
   app2.post("/api/admin/employees", async (req, res) => {
     if (!req.isAuthenticated() || req.user?.role !== "admin") {
       return res.status(401).json({ message: "Admin access required" });
     }
     try {
-      const { username, password, employeeId, department } = req.body;
+      const { username, password, employeeId, department, defaultStartTime, defaultEndTime } = req.body;
       const existingUser = await storage3.getUserByUsername(username);
       if (existingUser) {
         return res.status(400).json({ message: "Username already exists" });
@@ -1213,7 +1315,9 @@ function registerRoutes(app2, httpServer) {
         password: hashedPassword,
         role: "employee",
         employeeId,
-        department
+        department,
+        defaultStartTime,
+        defaultEndTime
       });
       res.status(201).json(user);
     } catch (error) {
@@ -1226,8 +1330,8 @@ function registerRoutes(app2, httpServer) {
       return res.status(401).json({ message: "Admin access required" });
     }
     try {
-      const { username, employeeId, department, password } = req.body;
-      const updateData = { username, employeeId, department };
+      const { username, employeeId, department, password, defaultStartTime, defaultEndTime } = req.body;
+      const updateData = { username, employeeId, department, defaultStartTime, defaultEndTime };
       if (password) {
         updateData.password = await hashPassword(password);
       }
@@ -1313,22 +1417,144 @@ function registerRoutes(app2, httpServer) {
         if (!attendanceRecord) {
           return res.status(400).json({ message: "No attendance record found" });
         }
-        const fileUrl = `/uploads/audio/${userId}/${file.filename}`;
-        const clientDuration = req.body.duration ? parseInt(req.body.duration, 10) : void 0;
-        const durationSeconds = clientDuration !== void 0 ? clientDuration : 0;
-        const savedRecording = await storage3.createAudioRecording({
-          userId,
-          attendanceId: attendanceRecord.id,
-          fileUrl,
-          fileName: file.filename,
-          fileSize: file.size,
-          duration: durationSeconds,
-          recordingDate: today,
-          isActive: false
+        const segmentPath = file.path ? path3.resolve(file.path) : path3.join(getAudioBaseDir(), userId, file.filename);
+        const uploadDir = path3.dirname(segmentPath);
+        const masterName = `daily-${today}.m4a`;
+        const masterPath = path3.join(uploadDir, masterName);
+        const resolvedFfmpeg = async () => {
+          if (process.env.FFMPEG_BIN && process.env.FFMPEG_BIN.trim()) return process.env.FFMPEG_BIN;
+          try {
+            const mod = await import("ffmpeg-static");
+            if (mod?.default) return mod.default;
+          } catch {
+          }
+          return "ffmpeg";
+        };
+        const runFfmpeg = async (args) => new Promise(async (resolve, reject) => {
+          const bin = await resolvedFfmpeg();
+          const p = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+          let stderr = "";
+          p.stderr.on("data", (d) => {
+            stderr += d.toString();
+          });
+          p.on("close", (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(stderr || `ffmpeg exited ${code}`));
+          });
         });
+        const clientDuration = req.body.duration ? parseInt(req.body.duration, 10) : void 0;
+        const segDur = clientDuration !== void 0 ? clientDuration : 0;
+        const expectedTimelineSec = Math.max(0, Math.floor((Date.now() - new Date(attendanceRecord.checkInTime).getTime()) / 1e3));
+        let newDurationSec = 0;
+        let finalFileSize = 0;
+        let finalFileUrl = `/uploads/audio/${userId}/${masterName}`;
+        let savedRecording = null;
+        try {
+          const hasMaster = fs3.existsSync(masterPath);
+          const existing = await storage3.getAudioRecordingByUserAndDate(userId, today);
+          const existingDuration = existing?.duration ? typeof existing.duration === "number" ? existing.duration : parseInt(String(existing.duration), 10) || 0 : 0;
+          const gapSec = Math.max(0, expectedTimelineSec - (existingDuration + segDur));
+          const tmpOut = path3.join(uploadDir, `daily-${today}-${Date.now()}.m4a`);
+          const silencePath = path3.join(uploadDir, `silence-${Date.now()}.m4a`);
+          const makeSilence = async (seconds) => {
+            if (seconds <= 0) return false;
+            await runFfmpeg(["-f", "lavfi", "-t", String(seconds), "-i", "anullsrc=channel_layout=mono:sample_rate=48000", "-c:a", "aac", "-b:a", "96k", silencePath]);
+            return true;
+          };
+          if (!hasMaster) {
+            if (gapSec > 0) {
+              await makeSilence(gapSec);
+              await runFfmpeg(["-i", silencePath, "-i", segmentPath, "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1[a]", "-map", "[a]", "-c:a", "aac", "-b:a", "96k", tmpOut]);
+              try {
+                await fs3.promises.unlink(silencePath);
+              } catch {
+              }
+            } else {
+              await runFfmpeg(["-i", segmentPath, "-c:a", "aac", "-b:a", "96k", tmpOut]);
+            }
+          } else {
+            if (gapSec > 0) {
+              await makeSilence(gapSec);
+              await runFfmpeg(["-i", masterPath, "-i", silencePath, "-i", segmentPath, "-filter_complex", "[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]", "-map", "[a]", "-c:a", "aac", "-b:a", "96k", tmpOut]);
+              try {
+                await fs3.promises.unlink(silencePath);
+              } catch {
+              }
+            } else {
+              await runFfmpeg(["-i", masterPath, "-i", segmentPath, "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1[a]", "-map", "[a]", "-c:a", "aac", "-b:a", "96k", tmpOut]);
+            }
+          }
+          await fs3.promises.rename(tmpOut, masterPath);
+          try {
+            await fs3.promises.unlink(segmentPath);
+          } catch {
+          }
+          const stat = fs3.statSync(masterPath);
+          finalFileSize = stat.size;
+          newDurationSec = expectedTimelineSec;
+          if (existing) {
+            savedRecording = await storage3.updateAudioRecording(existing.id, {
+              attendanceId: attendanceRecord.id,
+              fileUrl: finalFileUrl,
+              fileName: masterName,
+              fileSize: finalFileSize,
+              duration: newDurationSec,
+              recordingDate: today,
+              isActive: false
+            });
+          } else {
+            savedRecording = await storage3.createAudioRecording({
+              userId,
+              attendanceId: attendanceRecord.id,
+              fileUrl: finalFileUrl,
+              fileName: masterName,
+              fileSize: finalFileSize,
+              duration: newDurationSec,
+              recordingDate: today,
+              isActive: false
+            });
+          }
+        } catch (mergeErr) {
+          console.warn("ffmpeg merge failed, falling back to last file only:", mergeErr);
+          try {
+            await fs3.promises.rename(segmentPath, masterPath);
+          } catch {
+            await fs3.promises.copyFile(segmentPath, masterPath);
+            try {
+              await fs3.promises.unlink(segmentPath);
+            } catch {
+            }
+          }
+          const stat = fs3.statSync(masterPath);
+          finalFileSize = stat.size;
+          newDurationSec = segDur;
+          const existing = await storage3.getAudioRecordingByUserAndDate(userId, today);
+          if (existing) {
+            savedRecording = await storage3.updateAudioRecording(existing.id, {
+              attendanceId: attendanceRecord.id,
+              fileUrl: finalFileUrl,
+              fileName: masterName,
+              fileSize: finalFileSize,
+              duration: (typeof existing.duration === "number" ? existing.duration : parseInt(String(existing.duration || 0), 10) || 0) + segDur,
+              recordingDate: today,
+              isActive: false
+            });
+          } else {
+            savedRecording = await storage3.createAudioRecording({
+              userId,
+              attendanceId: attendanceRecord.id,
+              fileUrl: finalFileUrl,
+              fileName: masterName,
+              fileSize: finalFileSize,
+              duration: newDurationSec,
+              recordingDate: today,
+              isActive: false
+            });
+          }
+        }
         await storage3.enforceAudioStorageLimit(30 * 1024 * 1024 * 1024);
         await storage3.deleteOldAudioRecordings(15);
-        console.log(`\u2705 Audio segment saved: ${savedRecording?.id}`);
+        console.log(`merge ok: ${masterName} (${finalFileSize} bytes) :: ${savedRecording?.id || ""}`);
         res.json({ message: "Audio uploaded successfully", recording: savedRecording });
       } catch (error) {
         console.error("Audio upload error:", error);
@@ -1338,7 +1564,7 @@ function registerRoutes(app2, httpServer) {
   );
   app2.get("/uploads/audio/:userId/:filename", (req, res) => {
     const { userId, filename } = req.params;
-    const filePath2 = path3.join(__dirname2, "uploads", "audio", userId, filename);
+    const filePath2 = path3.join(getAudioBaseDir(), userId, filename);
     if (!fs3.existsSync(filePath2)) {
       return res.status(404).json({ message: "Audio file not found" });
     }
@@ -1371,6 +1597,108 @@ function registerRoutes(app2, httpServer) {
         "Content-Type": contentType
       });
       fs3.createReadStream(filePath2).pipe(res);
+    }
+  });
+  app2.post("/api/admin/employees/quick", async (req, res) => {
+    if (!req.isAuthenticated() || req.user?.role !== "admin") {
+      return res.status(401).json({ message: "Admin access required" });
+    }
+    try {
+      const { name, username, time, password } = req.body;
+      const uname = (username || name || "").trim();
+      if (!uname) return res.status(400).json({ message: "Provide name or username" });
+      const toHHMM = (h, m) => {
+        const hh = String(Math.max(0, Math.min(23, h))).padStart(2, "0");
+        const mm = String(Math.max(0, Math.min(59, m))).padStart(2, "0");
+        return `${hh}:${mm}`;
+      };
+      const parseTimeToken = (tok, fallbackAm) => {
+        tok = tok.trim().toLowerCase();
+        let ampm = void 0;
+        if (tok.endsWith("am")) {
+          ampm = "am";
+          tok = tok.slice(0, -2);
+        } else if (tok.endsWith("pm")) {
+          ampm = "pm";
+          tok = tok.slice(0, -2);
+        }
+        tok = tok.replace(/[^0-9:]/g, "");
+        if (!tok) return null;
+        let h = 0, m = 0;
+        if (tok.includes(":")) {
+          const [hs, ms] = tok.split(":");
+          h = parseInt(hs || "0", 10);
+          m = parseInt(ms || "0", 10) || 0;
+        } else {
+          h = parseInt(tok, 10);
+          m = 0;
+        }
+        if (isNaN(h) || isNaN(m)) return null;
+        if (ampm === "am") {
+          if (h === 12) h = 0;
+        } else if (ampm === "pm") {
+          if (h < 12) h += 12;
+        } else if (fallbackAm === true) {
+          if (h === 12) h = 0;
+        }
+        return { h, m };
+      };
+      const parseTimeRange = (range) => {
+        if (!range) return {};
+        const sep = range.includes(" to ") ? " to " : range.includes("-") ? "-" : range.includes("\u2013") ? "\u2013" : " to ";
+        const parts = range.split(sep);
+        const left = (parts[0] || "").trim();
+        const right = (parts[1] || "").trim();
+        const endHasPm = /pm\b/i.test(right);
+        const t1 = parseTimeToken(left, endHasPm ? true : void 0);
+        const t2 = parseTimeToken(right);
+        const out = {};
+        if (t1) out.start = toHHMM(t1.h, t1.m);
+        if (t2) out.end = toHHMM(t2.h, t2.m);
+        return out;
+      };
+      const { start, end } = parseTimeRange(time);
+      const pwd = password && String(password) || "123456";
+      const existing = await storage3.getUserByUsername(uname);
+      if (existing) return res.status(409).json({ message: "Username already exists" });
+      const hashed = await hashPassword(pwd);
+      const user = await storage3.createUser({
+        username: uname,
+        password: hashed,
+        role: "employee",
+        defaultStartTime: start,
+        defaultEndTime: end
+      });
+      return res.status(201).json(user);
+    } catch (error) {
+      console.error("Quick create employee error:", error);
+      return res.status(500).json({ message: "Failed to create employee" });
+    }
+  });
+  app2.patch("/api/admin/employees/schedule", async (req, res) => {
+    if (!req.isAuthenticated() || req.user?.role !== "admin") {
+      return res.status(401).json({ message: "Admin access required" });
+    }
+    try {
+      const { defaultStartTime, defaultEndTime, applyTo } = req.body;
+      if (!defaultStartTime && !defaultEndTime) {
+        return res.status(400).json({ message: "Provide defaultStartTime and/or defaultEndTime" });
+      }
+      const users3 = await storage3.getAllUsers();
+      const updates = users3.map(async (u) => {
+        const shouldUpdate = applyTo === "all" || applyTo === void 0 || !u.defaultStartTime && !u.defaultEndTime;
+        if (!shouldUpdate) return null;
+        const patch = {};
+        if (defaultStartTime) patch.defaultStartTime = defaultStartTime;
+        if (defaultEndTime) patch.defaultEndTime = defaultEndTime;
+        if (Object.keys(patch).length === 0) return null;
+        return storage3.updateUser(u.id, patch);
+      });
+      await Promise.all(updates);
+      res.json({ ok: true });
+    } catch (error) {
+      console.error("Bulk schedule update error:", error);
+      res.status(500).json({ message: "Failed to update schedules" });
     }
   });
   app2.get("/api/admin/audio/recordings", async (req, res) => {
@@ -1619,23 +1947,45 @@ var allowList = new Set([
   "http://localhost",
   "https://localhost"
 ].filter(Boolean));
-var dynamicCorsOrigin = (origin, callback) => {
-  if (!origin) return callback(null, true);
+function isAllowedOrigin(origin) {
+  if (!origin) return true;
   try {
     const o = new URL(origin);
     const host = o.hostname;
-    if (allowList.has(origin)) return callback(null, true);
-    if (host.endsWith(".ngrok-free.app")) return callback(null, true);
-    if (host.endsWith(".loca.lt")) return callback(null, true);
-    if (host.endsWith(".trycloudflare.com")) return callback(null, true);
-    if (host.endsWith(".deno.dev")) return callback(null, true);
-    if (/^(10\.|192\.168\.|172\.)/.test(host)) return callback(null, true);
+    if (allowList.has(origin)) return true;
+    if (host.endsWith(".ngrok-free.app")) return true;
+    if (host.endsWith(".loca.lt")) return true;
+    if (host.endsWith(".trycloudflare.com")) return true;
+    if (host.endsWith(".deno.dev")) return true;
+    if (host.endsWith(".deno.net")) return true;
+    if (/^(10\.|192\.168\.|172\.)/.test(host)) return true;
   } catch {
   }
-  return callback(null, false);
-};
-app.use(cors({ origin: dynamicCorsOrigin, credentials: true }));
-app.options("*", cors({ credentials: true, origin: dynamicCorsOrigin }));
+  return false;
+}
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (isAllowedOrigin(origin)) {
+    if (origin) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Vary", "Origin");
+    }
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+  }
+  next();
+});
+app.options("*", (req, res) => {
+  const origin = req.headers.origin;
+  if (!isAllowedOrigin(origin)) return res.sendStatus(403);
+  if (origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+  res.setHeader("Access-Control-Allow-Methods", req.headers["access-control-request-method"] || "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", req.headers["access-control-request-headers"] || "Content-Type, Authorization, X-Requested-With, X-Device-Id");
+  return res.sendStatus(204);
+});
 app.use((req, res, next) => {
   const start = Date.now();
   const path7 = req.path;

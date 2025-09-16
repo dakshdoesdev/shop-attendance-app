@@ -77,6 +77,109 @@ function BulkWorkHoursCard() {
   );
 }
 
+function QuickAddEmployee() {
+  const { toast } = useToast();
+  const [name, setName] = useState("");
+  const [time, setTime] = useState("8am to 9pm");
+  const [password, setPassword] = useState("123456");
+  const [pending, setPending] = useState(false);
+  function toHHMM(h: number, m: number): string {
+    const hh = String(Math.max(0, Math.min(23, h))).padStart(2, '0');
+    const mm = String(Math.max(0, Math.min(59, m))).padStart(2, '0');
+    return `${hh}:${mm}`;
+  }
+  function parseTimeToken(tok: string, fallbackAm?: boolean): { h: number; m: number } | null {
+    tok = tok.trim().toLowerCase();
+    let ampm: 'am' | 'pm' | undefined = undefined;
+    if (tok.endsWith('am')) { ampm = 'am'; tok = tok.slice(0, -2); }
+    else if (tok.endsWith('pm')) { ampm = 'pm'; tok = tok.slice(0, -2); }
+    tok = tok.replace(/[^0-9:]/g, '');
+    if (!tok) return null;
+    let h = 0, m = 0;
+    if (tok.includes(':')) {
+      const [hs, ms] = tok.split(':');
+      h = parseInt(hs || '0', 10); m = parseInt(ms || '0', 10) || 0;
+    } else {
+      h = parseInt(tok, 10); m = 0;
+    }
+    if (isNaN(h) || isNaN(m)) return null;
+    if (ampm === 'am') { if (h === 12) h = 0; }
+    else if (ampm === 'pm') { if (h < 12) h += 12; }
+    else if (fallbackAm === true) { if (h === 12) h = 0; }
+    return { h, m };
+  }
+  function parseTimeRange(range?: string): { start?: string; end?: string } {
+    if (!range) return {};
+    const normalized = range.replace(/–/g, '-');
+    const sep = normalized.includes(' to ') ? ' to ' : (normalized.includes('-') ? '-' : ' to ');
+    const parts = normalized.split(sep);
+    const left = (parts[0] || '').trim();
+    const right = (parts[1] || '').trim();
+    const endHasPm = /pm\b/i.test(right);
+    const t1 = parseTimeToken(left, endHasPm ? true : undefined);
+    const t2 = parseTimeToken(right);
+    const out: any = {};
+    if (t1) out.start = toHHMM(t1.h, t1.m);
+    if (t2) out.end = toHHMM(t2.h, t2.m);
+    return out;
+  }
+  const preview = parseTimeRange(time);
+
+  async function createQuick() {
+    try {
+      if (!name.trim()) {
+        toast({ title: 'Name required', description: 'Enter a username (e.g., xyz)', variant: 'destructive' });
+        return;
+      }
+      setPending(true);
+      const res = await _api('POST', '/api/admin/employees/quick', { name: name.trim(), time: time.trim(), password });
+      if (!res.ok) throw new Error(`${res.status}`);
+      await res.json();
+      toast({ title: 'Employee created', description: `${name.trim()} added` });
+      try { (window as any).location?.reload(); } catch {}
+    } catch (e: any) {
+      toast({ title: 'Failed to create', description: e?.message || String(e), variant: 'destructive' });
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <Card className="mb-6">
+      <CardHeader>
+        <CardTitle>Quick Add Employee</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 items-end">
+          <div>
+            <label className="block text-sm font-medium mb-1">Username</label>
+            <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. xyz" data-testid="quick-username" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Time Range</label>
+            <Input value={time} onChange={(e) => setTime(e.target.value)} placeholder="e.g. 7am to 6pm, 7-6, 09:15-18:30" data-testid="quick-time" />
+            <div className="text-xs text-gray-500 mt-1">
+              {preview.start || preview.end
+                ? <>Will set Start: <span className="font-medium">{preview.start || '-'}</span> End: <span className="font-medium">{preview.end || '-'}</span></>
+                : <>Could not parse time. You can leave it blank or enter like <span className="font-mono">7am to 6pm</span>.</>}
+            </div>
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Password</label>
+            <Input type="text" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="default 123456" data-testid="quick-password" />
+          </div>
+          <div>
+            <Button onClick={createQuick} disabled={pending} className="w-full">
+              {pending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              Create
+            </Button>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 const createEmployeeSchema = z.object({
   username: z.string().min(1, "Username is required"),
   password: z.string().min(6, "Password must be at least 6 characters"),
@@ -97,12 +200,19 @@ type EditEmployeeData = z.infer<typeof editEmployeeSchema>;
 export default function AdminEmployees() {
   const { user, logoutMutation } = useAuth();
   const { toast } = useToast();
+  const [search, setSearch] = useState("");
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [editDialogOpen, setEditDialogOpen] = useState(false);
   const [editingEmployee, setEditingEmployee] = useState<User | null>(null);
 
   const { data: employees, isLoading } = useQuery<User[]>({
     queryKey: ["/api/admin/employees"],
+  });
+  const filtered = (employees || []).filter(e => {
+    const q = search.trim().toLowerCase();
+    if (!q) return true;
+    const dept = (e as any).department || '';
+    return e.username.toLowerCase().includes(q) || String(dept).toLowerCase().includes(q);
   });
 
   const createEmployeeMutation = useMutation({
@@ -174,9 +284,9 @@ export default function AdminEmployees() {
     resolver: zodResolver(createEmployeeSchema),
     defaultValues: {
       username: "",
-      password: "",
-      defaultStartTime: "",
-      defaultEndTime: "",
+      password: "123456",
+      defaultStartTime: "08:00",
+      defaultEndTime: "21:00",
     },
   });
 
@@ -234,7 +344,15 @@ export default function AdminEmployees() {
                 Employee Management
               </h1>
             </div>
-            <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
+              <div className="flex items-center gap-3">
+                <input
+                  className="border rounded px-3 py-1 text-sm"
+                  placeholder="Search username or department"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                />
+              </div>
+              <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
               <DialogTrigger asChild>
                 <Button className="bg-primary hover:bg-blue-700" data-testid="button-add-employee">
                   <UserPlus className="mr-2 h-4 w-4" />
@@ -426,6 +544,8 @@ export default function AdminEmployees() {
       </div>
 
       <div className="max-w-7xl mx-auto px-6 py-8">
+        <QuickAddEmployee />
+        <BulkWorkHoursCard />
         <Card>
           <CardContent>
             {isLoading ? (
@@ -445,7 +565,7 @@ export default function AdminEmployees() {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {employees?.map((employee) => (
+                    {filtered?.map((employee) => (
                       <TableRow key={employee.id} data-testid={`row-employee-${employee.id}`}>
                         <TableCell>
                           <div>
