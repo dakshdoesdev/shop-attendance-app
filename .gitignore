@@ -1,8 +1,11 @@
 node_modules
 .DS_Store
-server/public
+server
+server/uploads/
+dist/uploads/
+
+/public
 vite.config.ts.*
 *.tar.gz
 .env
-server/uploads/
-dist/uploads/
+

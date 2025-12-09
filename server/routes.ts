@@ -1,4 +1,4 @@
-import type { Express } from "express";
+import type { Express, Request as ExpressRequest } from "express";
 import type { Server } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { hashPassword } from "./auth";
@@ -10,30 +10,30 @@ import { fileURLToPath } from "url";
 import jwt from "jsonwebtoken";
 import { dirname } from "path";
 import { spawn } from "child_process";
+import { ensureUserAudioDir, getAudioBaseDir, getUserAudioDirKey, resolveFilePathFromUrl } from "./audio-paths";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 
-// Resolve base directory for audio storage (override via AUDIO_UPLOAD_DIR)
-function getAudioBaseDir() {
-  const override = process.env.AUDIO_UPLOAD_DIR;
-  if (override && override.trim()) {
-    try { fs.mkdirSync(override, { recursive: true }); } catch {}
-    return override;
+type RequestWithAudioKey = ExpressRequest & { audioDirKey?: string };
+
+function resolveRequestAudioDir(req: RequestWithAudioKey) {
+  if (req.audioDirKey) {
+    const dir = path.join(getAudioBaseDir(), req.audioDirKey);
+    return { key: req.audioDirKey, dir };
   }
-  const def = path.join(__dirname, 'uploads', 'audio');
-  try { fs.mkdirSync(def, { recursive: true }); } catch {}
-  return def;
+  const { key, dir } = ensureUserAudioDir(req.user as any);
+  req.audioDirKey = key;
+  return { key, dir };
 }
 
 // Configure multer for audio file uploads
 const audioStorage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const userId = req.user?.id || 'unknown';
-    const uploadPath = path.join(getAudioBaseDir(), userId);
-    fs.mkdirSync(uploadPath, { recursive: true });
-    cb(null, uploadPath);
+    const { key, dir } = resolveRequestAudioDir(req as RequestWithAudioKey);
+    (req as RequestWithAudioKey).audioDirKey = key;
+    cb(null, dir);
   },
   filename: (req, file, cb) => {
     const date = new Date().toISOString().split('T')[0];
@@ -102,8 +102,8 @@ export function registerRoutes(app: Express, httpServer: Server) {
 
   // Employee attendance routes
   app.post("/api/attendance/checkin", async (req, res) => {
-    if (!req.isAuthenticated() || req.user?.role !== "employee") {
-      return res.status(401).json({ message: "Employee access required" });
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Login required" });
     }
 
     try {
@@ -162,8 +162,8 @@ export function registerRoutes(app: Express, httpServer: Server) {
   });
 
   app.post("/api/attendance/checkout", async (req, res) => {
-    if (!req.isAuthenticated() || req.user?.role !== "employee") {
-      return res.status(401).json({ message: "Employee access required" });
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Login required" });
     }
 
     try {
@@ -195,7 +195,10 @@ export function registerRoutes(app: Express, httpServer: Server) {
       try {
         const active = await storage.getActiveAudioRecordingByAttendance(existingRecord.id);
         if (active) {
-          const durationSec = Math.floor((checkOutTime.getTime() - existingRecord.checkInTime.getTime()) / 1000);
+          // Keep the recorded audio length if we have it; only fall back to session length if nothing was captured
+          const recordedDuration = Number(active.duration) || 0;
+          const sessionDuration = Math.floor((checkOutTime.getTime() - existingRecord.checkInTime.getTime()) / 1000);
+          const durationSec = recordedDuration > 0 ? recordedDuration : sessionDuration;
           const today = new Date().toISOString().split('T')[0];
           await storage.updateAudioRecording(active.id, {
             isActive: false,
@@ -478,27 +481,31 @@ export function registerRoutes(app: Express, httpServer: Server) {
       return res.status(401).json({ message: "Employee access required" });
     }
 
+    const cleanupPaths = new Set<string>();
+
     try {
       const file = req.file;
       if (!file) {
         return res.status(400).json({ message: "No audio file provided" });
       }
 
+      const request = req as RequestWithAudioKey;
       const userId = req.user.id;
       const today = new Date().toISOString().split('T')[0];
-      
-      console.log(`🎤 Audio uploaded: ${file.filename}, size: ${file.size} bytes`);
-      
+
+      console.log(`[audio] upload: ${file.filename} (${file.size} bytes)`);
+
       const attendanceRecord = await storage.getTodayAttendanceRecord(userId, today);
-      
+
       if (!attendanceRecord) {
         return res.status(400).json({ message: "No attendance record found" });
       }
+      const { key: dirKey, dir: userDir } = resolveRequestAudioDir(request);
+      const rawPath = (file as any).path ? path.resolve((file as any).path) : path.join(userDir, file.filename);
+      cleanupPaths.add(rawPath);
 
-      const segmentPath = (file as any).path ? path.resolve((file as any).path) : path.join(getAudioBaseDir(), userId, file.filename);
-      const uploadDir = path.dirname(segmentPath);
       const masterName = `daily-${today}.m4a`;
-      const masterPath = path.join(uploadDir, masterName);
+      const masterPath = path.join(userDir, masterName);
 
       const resolvedFfmpeg = async (): Promise<string> => {
         if (process.env.FFMPEG_BIN && process.env.FFMPEG_BIN.trim()) return process.env.FFMPEG_BIN;
@@ -510,7 +517,7 @@ export function registerRoutes(app: Express, httpServer: Server) {
       };
       const runFfmpeg = async (args: string[]) => new Promise<void>(async (resolve, reject) => {
         const bin = await resolvedFfmpeg();
-        const p = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+        const p = spawn(bin, ['-y', ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
         let stderr = '';
         p.stderr.on('data', (d) => { stderr += d.toString(); });
         p.on('close', (code) => {
@@ -518,130 +525,149 @@ export function registerRoutes(app: Express, httpServer: Server) {
         });
       });
 
-      const clientDuration = req.body.duration ? parseInt(req.body.duration, 10) : undefined;
-      const segDur = clientDuration !== undefined ? clientDuration : 0;
-
-      // Calculate expected timeline length from check-in to now
-      const expectedTimelineSec = Math.max(0, Math.floor((Date.now() - new Date(attendanceRecord.checkInTime).getTime()) / 1000));
-
-      let newDurationSec = 0;
-      let finalFileSize = 0;
-      let finalFileUrl = `/uploads/audio/${userId}/${masterName}`;
-      let savedRecording: any = null;
-
-      try {
-        const hasMaster = fs.existsSync(masterPath);
-        const existing = await storage.getAudioRecordingByUserAndDate(userId, today);
-        const existingDuration = existing?.duration ? (typeof existing.duration === 'number' ? existing.duration : parseInt(String(existing.duration), 10) || 0) : 0;
-        const gapSec = Math.max(0, expectedTimelineSec - (existingDuration + segDur));
-
-        const tmpOut = path.join(uploadDir, `daily-${today}-${Date.now()}.m4a`);
-        const silencePath = path.join(uploadDir, `silence-${Date.now()}.m4a`);
-
-        // Helper to create silence file
-        const makeSilence = async (seconds: number) => {
-          if (seconds <= 0) return false;
-          await runFfmpeg(['-f','lavfi','-t', String(seconds), '-i','anullsrc=channel_layout=mono:sample_rate=48000', '-c:a','aac','-b:a','96k', silencePath]);
-          return true;
-        };
-
-        if (!hasMaster) {
-          if (gapSec > 0) {
-            await makeSilence(gapSec);
-            await runFfmpeg(['-i', silencePath, '-i', segmentPath, '-filter_complex','[0:a][1:a]concat=n=2:v=0:a=1[a]','-map','[a]','-c:a','aac','-b:a','96k', tmpOut]);
-            try { await fs.promises.unlink(silencePath); } catch {}
-          } else {
-            // Transcode first segment to normalized AAC
-            await runFfmpeg(['-i', segmentPath, '-c:a','aac','-b:a','96k', tmpOut]);
-          }
-        } else {
-          // Build concat of master + optional silence + new segment
-          if (gapSec > 0) {
-            await makeSilence(gapSec);
-            await runFfmpeg(['-i', masterPath, '-i', silencePath, '-i', segmentPath, '-filter_complex','[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]','-map','[a]','-c:a','aac','-b:a','96k', tmpOut]);
-            try { await fs.promises.unlink(silencePath); } catch {}
-          } else {
-            await runFfmpeg(['-i', masterPath, '-i', segmentPath, '-filter_complex','[0:a][1:a]concat=n=2:v=0:a=1[a]','-map','[a]','-c:a','aac','-b:a','96k', tmpOut]);
-          }
-        }
-
-        // Replace master with tmpOut
-        await fs.promises.rename(tmpOut, masterPath);
-        // Cleanup uploaded raw segment to save space
-        try { await fs.promises.unlink(segmentPath); } catch {}
-
-        const stat = fs.statSync(masterPath);
-        finalFileSize = stat.size;
-        newDurationSec = expectedTimelineSec; // master matches timeline up to now
-
-        // Update or create DB record pointing to master file
-        if (existing) {
-          savedRecording = await storage.updateAudioRecording(existing.id, {
-            attendanceId: attendanceRecord.id,
-            fileUrl: finalFileUrl,
-            fileName: masterName,
-            fileSize: finalFileSize,
-            duration: newDurationSec,
-            recordingDate: today,
-            isActive: false,
-          });
-        } else {
-          savedRecording = await storage.createAudioRecording({
-            userId,
-            attendanceId: attendanceRecord.id,
-            fileUrl: finalFileUrl,
-            fileName: masterName,
-            fileSize: finalFileSize,
-            duration: newDurationSec,
-            recordingDate: today,
-            isActive: false,
-          });
-        }
-      } catch (mergeErr) {
-        console.warn('ffmpeg merge failed, falling back to last file only:', mergeErr);
-        // Fallback: keep just the latest file as the day's file
+      let segmentInputPath = rawPath;
+      const segmentExt = path.extname(rawPath).toLowerCase();
+      const mime = file.mimetype || '';
+      if (mime.includes('webm') || segmentExt === '.webm') {
+        const normalizedPath = path.join(userDir, `segment-${Date.now()}.m4a`);
+        cleanupPaths.add(normalizedPath);
         try {
-          await fs.promises.rename(segmentPath, masterPath);
-        } catch {
-          // if rename fails due to existing, overwrite
-          await fs.promises.copyFile(segmentPath, masterPath);
-          try { await fs.promises.unlink(segmentPath); } catch {}
-        }
-        const stat = fs.statSync(masterPath);
-        finalFileSize = stat.size;
-        newDurationSec = segDur;
-        const existing = await storage.getAudioRecordingByUserAndDate(userId, today);
-        if (existing) {
-          savedRecording = await storage.updateAudioRecording(existing.id, {
-            attendanceId: attendanceRecord.id,
-            fileUrl: finalFileUrl,
-            fileName: masterName,
-            fileSize: finalFileSize,
-            duration: (typeof existing.duration === 'number' ? existing.duration : parseInt(String(existing.duration || 0), 10) || 0) + segDur,
-            recordingDate: today,
-            isActive: false,
-          });
-        } else {
-          savedRecording = await storage.createAudioRecording({
-            userId,
-            attendanceId: attendanceRecord.id,
-            fileUrl: finalFileUrl,
-            fileName: masterName,
-            fileSize: finalFileSize,
-            duration: newDurationSec,
-            recordingDate: today,
-            isActive: false,
-          });
+          await runFfmpeg(['-f', 'webm', '-i', segmentInputPath, '-c:a', 'aac', '-b:a', '64k', '-ar', '48000', '-movflags', '+faststart', normalizedPath]);
+          segmentInputPath = normalizedPath;
+        } catch (remuxErr) {
+          console.warn('webm remux failed; using raw segment:', remuxErr);
+          cleanupPaths.delete(normalizedPath);
         }
       }
 
+      try {
+        const tempOutput = path.join(userDir, `daily-${today}-${Date.now()}.m4a`);
+        cleanupPaths.add(tempOutput);
+        await runFfmpeg(['-i', segmentInputPath, '-acodec', 'aac', '-b:a', '64k', '-ar', '48000', '-movflags', '+faststart', tempOutput]);
+
+        // If a master file already exists for today, append the new segment
+        // using ffmpeg concat demuxer to avoid re-encoding. Otherwise, promote
+        // this segment to be the master for today.
+        const masterExists = fs.existsSync(masterPath);
+        if (masterExists) {
+          const mergedPath = path.join(userDir, `daily-${today}-merged-${Date.now()}.m4a`);
+          const listPath = path.join(userDir, `concat-${Date.now()}.txt`);
+          // Build concat list file (absolute paths). Use forward slashes-safe quoting.
+          const esc = (p: string) => p.replace(/\\/g, '/').replace(/'/g, "'\\''");
+          const listContent = `file '${esc(masterPath)}'\nfile '${esc(tempOutput)}'\n`;
+          await fs.promises.writeFile(listPath, listContent, 'utf8');
+          try {
+            await runFfmpeg(['-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', mergedPath]);
+            await fs.promises.rm(masterPath, { force: true });
+            await fs.promises.rename(mergedPath, masterPath);
+            cleanupPaths.delete(mergedPath);
+          } finally {
+            try { await fs.promises.rm(listPath, { force: true }); } catch {}
+          }
+        } else {
+          await fs.promises.rename(tempOutput, masterPath);
+        }
+        cleanupPaths.delete(tempOutput);
+      } catch (ffmpegErr) {
+        console.warn('[audio] ffmpeg failed, keeping raw segment:', ffmpegErr);
+        // Fall back to using the raw segment directly
+        const finalDirKey = dirKey || getUserAudioDirKey(req.user as any);
+        const finalFileUrl = `/uploads/audio/${finalDirKey}/${path.basename(segmentInputPath)}`;
+        const stat = fs.statSync(segmentInputPath);
+        const rawDuration = Number((req.body as any)?.duration);
+        const approxDuration = Number.isFinite(rawDuration) && rawDuration > 0
+          ? Math.round(rawDuration)
+          // bitrate is 64 kbps => ~8 KB/s; use 8192 to match 64 * 1024 / 8
+          : Math.max(1, Math.round(stat.size / 8192));
+        const recordPayload = {
+          attendanceId: attendanceRecord.id,
+          fileUrl: finalFileUrl,
+          fileName: path.basename(segmentInputPath),
+          fileSize: stat.size,
+          duration: approxDuration,
+          recordingDate: today,
+        } as const;
+        const existing = await storage.getAudioRecordingByUserAndDate(userId, today);
+        let savedRecording: any;
+        if (existing) {
+          const updatedPayload: any = { ...recordPayload, duration: Math.max(1, (existing.duration || 0) + approxDuration) };
+          savedRecording = await storage.updateAudioRecording(existing.id, updatedPayload);
+        } else {
+          savedRecording = await storage.createAudioRecording({
+            userId,
+            ...recordPayload,
+            isActive: true,
+            duration: approxDuration,
+          } as any);
+        }
+        await storage.enforceAudioStorageLimit(30 * 1024 * 1024 * 1024);
+        await storage.deleteOldAudioRecordings(15);
+        cleanupPaths.clear();
+        return res.json({ message: "Audio uploaded (raw fallback)", recording: savedRecording });
+      }
+
+      if (segmentInputPath !== masterPath) {
+        try { await fs.promises.unlink(segmentInputPath); } catch {}
+        cleanupPaths.delete(segmentInputPath);
+      }
+      if (rawPath !== masterPath) {
+        try { await fs.promises.unlink(rawPath); } catch {}
+        cleanupPaths.delete(rawPath);
+      }
+
+      const stat = fs.statSync(masterPath);
+      const finalFileSize = stat.size;
+      const rawDuration = Number((req.body as any)?.duration);
+      const approxDuration = Number.isFinite(rawDuration) && rawDuration > 0
+        ? Math.round(rawDuration)
+        // bitrate is 64 kbps => ~8 KB/s; use 8192 to match 64 * 1024 / 8
+        : Math.max(1, Math.round(finalFileSize / 8192));
+
+      const finalDirKey = dirKey || getUserAudioDirKey(req.user as any);
+      const finalFileUrl = `/uploads/audio/${finalDirKey}/${masterName}`;
+
+      // Do NOT flip isActive to false here. An active session should
+      // remain active until checkout or an explicit admin stop. Only
+      // update file and metadata.
+      const recordPayload = {
+        attendanceId: attendanceRecord.id,
+        fileUrl: finalFileUrl,
+        fileName: masterName,
+        fileSize: finalFileSize,
+        duration: approxDuration,
+        recordingDate: today,
+      } as const;
+
+      const existing = await storage.getAudioRecordingByUserAndDate(userId, today);
+      let savedRecording: any;
+      if (existing) {
+        const previousPath = resolveFilePathFromUrl(existing.fileUrl);
+        if (previousPath && previousPath !== masterPath) {
+          try { await fs.promises.rm(previousPath, { force: true }); } catch {}
+        }
+        // Increment duration so UI reflects total for the day
+        const updatedPayload: any = { ...recordPayload, duration: Math.max(1, (existing.duration || 0) + approxDuration) };
+        savedRecording = await storage.updateAudioRecording(existing.id, updatedPayload);
+      } else {
+        // If no record exists yet for today, create one and mark it active
+        savedRecording = await storage.createAudioRecording({
+          userId,
+          ...recordPayload,
+          isActive: true,
+          duration: approxDuration,
+        } as any);
+      }
+
       await storage.enforceAudioStorageLimit(30 * 1024 * 1024 * 1024);
-      // Also enforce 15-day retention on upload
       await storage.deleteOldAudioRecordings(15);
 
-      console.log(`merge ok: ${masterName} (${finalFileSize} bytes) :: ${savedRecording?.id || ''}`);
+      console.log(`[audio] ready: ${masterName} (${finalFileSize} bytes) :: ${savedRecording?.id || ''}`);
+      cleanupPaths.clear();
       res.json({ message: "Audio uploaded successfully", recording: savedRecording });
     } catch (error) {
+      for (const candidate of cleanupPaths) {
+        try { await fs.promises.unlink(candidate); } catch {}
+      }
       console.error('Audio upload error:', error);
       res.status(500).json({ message: "Failed to upload audio" });
     }
@@ -650,10 +676,18 @@ export function registerRoutes(app: Express, httpServer: Server) {
   // Serve audio files (with proper Content-Type and HTTP Range support)
   app.get("/uploads/audio/:userId/:filename", (req, res) => {
     const { userId, filename } = req.params as { userId: string; filename: string };
-    const filePath = path.join(getAudioBaseDir(), userId, filename);
+    const baseDir = getAudioBaseDir();
+    let filePath = path.join(baseDir, userId, filename);
 
+    // Fallback to legacy location (server/uploads/audio) if primary base doesn't have the file
     if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ message: "Audio file not found" });
+      const legacyBase = path.join(__dirname, "uploads", "audio");
+      const legacyPath = path.join(legacyBase, userId, filename);
+      if (legacyBase !== baseDir && fs.existsSync(legacyPath)) {
+        filePath = legacyPath;
+      } else {
+        return res.status(404).json({ message: "Audio file not found" });
+      }
     }
 
     const stat = fs.statSync(filePath);
@@ -884,17 +918,18 @@ export function registerRoutes(app: Express, httpServer: Server) {
       }
 
       if (recording.fileName) {
-        const filePath = path.join(
-          __dirname,
-          'uploads',
-          'audio',
-          recording.userId,
-          recording.fileName
-        );
-        try {
-          await fs.promises.unlink(filePath);
-        } catch (err) {
-          console.warn('File delete error:', err);
+        let filePath = resolveFilePathFromUrl(recording.fileUrl);
+        if (!filePath) {
+          const user = await storage.getUser(recording.userId).catch(() => undefined);
+          const dirKey = getUserAudioDirKey(user ?? { id: recording.userId });
+          filePath = path.join(getAudioBaseDir(), dirKey, recording.fileName);
+        }
+        if (filePath) {
+          try {
+            await fs.promises.unlink(filePath);
+          } catch (err) {
+            console.warn('File delete error:', err);
+          }
         }
       }
 

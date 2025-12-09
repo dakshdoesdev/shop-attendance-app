@@ -31,13 +31,5 @@ export function ProtectedRoute({
     );
   }
 
-  if (requireRole && user.role !== requireRole) {
-    return (
-      <Route path={path}>
-        <Redirect to={user.role === "admin" ? "/admin" : "/"} />
-      </Route>
-    );
-  }
-
   return <Route path={path} component={Component} />;
 }

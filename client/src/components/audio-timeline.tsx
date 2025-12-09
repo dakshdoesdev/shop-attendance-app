@@ -139,7 +139,8 @@ export function AudioTimeline({ fileUrl, startTime, duration, audioRef }: AudioT
       segments.forEach((value, index) => {
         const x = (index / segments.length) * width;
         const barWidth = width / segments.length;
-        const barHeight = value * waveformHeight;
+        // Scale up amplitude more aggressively (x2.5) and clamp to avoid overdraw
+        const barHeight = Math.min(value * 2.5, 1.0) * waveformHeight;
         ctx.fillStyle = value > 0.01 ? "#facc15" : "#e5e7eb"; // yellow for voice
         ctx.fillRect(x, waveformHeight - barHeight, barWidth, barHeight);
       });

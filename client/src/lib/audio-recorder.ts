@@ -3,33 +3,37 @@ import { getUploadBase } from "./queryClient";
 export class AudioRecorder {
   private mediaRecorder: MediaRecorder | null = null;
   private stream: MediaStream | null = null;
-  private chunks: Blob[] = [];
   private isRecording = false;
   private startTime: Date | null = null;
+  private chunkStartTime: number = 0;
+  private chunkTimer: any = null;
+  private isCycling = false;
   private lastUploadAt: number | null = null;
+  private sentFirstChunk = false;
   private chosenMimeType: string | null = null;
-  private fileExtension: string = 'webm';
+  // Use WebM/Opus for reliable chunked recordings; fragmented mp4 chunks often fail ffmpeg concat
+  private fileExtension: string = 'ogg';
 
   private pickSupportedMime(): void {
     try {
       const candidates = [
+        'audio/ogg;codecs=opus',
         'audio/webm;codecs=opus',
+        'audio/ogg',
         'audio/webm',
-        'audio/mp4',
-        'audio/aac'
       ];
       for (const t of candidates) {
         if ((window as any).MediaRecorder && (MediaRecorder as any).isTypeSupported && MediaRecorder.isTypeSupported(t)) {
           this.chosenMimeType = t;
-          this.fileExtension = t.includes('mp4') || t.includes('aac') ? 'm4a' : 'webm';
+          this.fileExtension = t.includes('ogg') ? 'ogg' : 'webm';
           return;
         }
       }
       this.chosenMimeType = null;
-      this.fileExtension = 'webm';
+      this.fileExtension = 'ogg';
     } catch {
       this.chosenMimeType = null;
-      this.fileExtension = 'webm';
+      this.fileExtension = 'ogg';
     }
   }
 
@@ -51,19 +55,27 @@ export class AudioRecorder {
 
       this.pickSupportedMime();
 
+      // Force a supported mime (Chromium on Linux can be picky)
       const options: MediaRecorderOptions = this.chosenMimeType
         ? { mimeType: this.chosenMimeType, audioBitsPerSecond: 128000 }
-        : { audioBitsPerSecond: 128000 };
+        : { mimeType: 'audio/ogg;codecs=opus', audioBitsPerSecond: 128000 };
 
       this.mediaRecorder = new MediaRecorder(this.stream, options);
-      this.chunks = [];
       this.startTime = new Date();
+      this.chunkStartTime = Date.now();
       this.lastUploadAt = Date.now();
+      this.sentFirstChunk = false;
+      this.isCycling = false;
 
       this.mediaRecorder.ondataavailable = (event) => {
+        // Single-blob mode: rely on the encoder to flush a complete file (with headers) when stopped/requested
         if (event.data.size > 0) {
-          this.chunks.push(event.data);
-          console.log(`🎤 Audio chunk recorded: ${event.data.size} bytes`);
+          const now = Date.now();
+          // Calculate chunk duration, not total session duration, to avoid double-counting on server
+          const duration = Math.max(1, Math.floor((now - this.chunkStartTime) / 1000));
+          this.sentFirstChunk = true;
+          console.log(`🎤 Audio chunk recorded: ${event.data.size} bytes (~${duration}s)`);
+          void this.uploadAudio(event.data, duration);
         }
       };
 
@@ -71,8 +83,26 @@ export class AudioRecorder {
         console.error('🎤 MediaRecorder error:', event);
       };
 
-      this.mediaRecorder.start(1000); // Record in 1-second chunks
+      this.mediaRecorder.onstop = () => {
+        if (this.isCycling) {
+            console.log('🔄 Cycling recording chunk...');
+            this.isCycling = false;
+            // Restart recording for next chunk
+            if (this.mediaRecorder && this.isRecording) {
+              this.chunkStartTime = Date.now();
+              this.mediaRecorder.start();
+              this.startChunkTimer();
+            }
+        } else {
+            console.log(`🔴 Recording stopped`);
+            this.cleanup();
+        }
+      };
+
+      // Start without timeslice; rely on periodic stop/start to flush valid containers
+      this.mediaRecorder.start();
       this.isRecording = true;
+      this.startChunkTimer();
       
       console.log('🎤 Audio recording started successfully');
     } catch (error) {
@@ -88,6 +118,17 @@ export class AudioRecorder {
     }
   }
 
+  private startChunkTimer() {
+    if (this.chunkTimer) clearTimeout(this.chunkTimer);
+    // Restart every 60 seconds to ensure data is saved safely
+    this.chunkTimer = setTimeout(() => {
+        if (this.isRecording && this.mediaRecorder && this.mediaRecorder.state === 'recording') {
+            this.isCycling = true;
+            this.mediaRecorder.stop();
+        }
+    }, 60000); 
+  }
+
   async stopRecording(): Promise<Blob | null> {
     if (!this.isRecording || !this.mediaRecorder) {
       console.log('🔴 No active recording to stop');
@@ -95,6 +136,8 @@ export class AudioRecorder {
     }
 
     console.log('🔴 Stopping audio recording...');
+    this.isRecording = false; // Prevent cycling
+    if (this.chunkTimer) clearTimeout(this.chunkTimer);
 
     return new Promise((resolve) => {
       if (!this.mediaRecorder) {
@@ -102,24 +145,20 @@ export class AudioRecorder {
         return;
       }
 
-      this.mediaRecorder.onstop = async () => {
-        const blob = new Blob(this.chunks, { type: this.chosenMimeType || 'audio/webm' });
-        const duration = this.startTime ? Math.floor((Date.now() - this.startTime.getTime()) / 1000) : 0;
-
-        console.log(`🔴 Recording stopped - Duration: ${duration}s, Size: ${blob.size} bytes`);
-
-        if (blob.size > 0) {
-          await this.uploadAudio(blob, duration);
-        } else {
-          console.warn('⚠️ Recording blob is empty, skipping upload');
-        }
-
-        this.cleanup();
-        resolve(blob);
+      // Hook cleanup into the final stop
+      const originalOnStop = this.mediaRecorder.onstop;
+      this.mediaRecorder.onstop = (ev) => {
+         // Call original to handle the final data/upload
+         if (originalOnStop) originalOnStop.call(this.mediaRecorder, ev);
+         resolve(null);
       };
 
-      this.mediaRecorder.stop();
-      this.isRecording = false;
+      if (this.mediaRecorder.state !== 'inactive') {
+        this.mediaRecorder.stop();
+      } else {
+        this.cleanup();
+        resolve(null);
+      }
     });
   }
 
@@ -162,27 +201,6 @@ export class AudioRecorder {
     }
   }
 
-  // Upload a partial segment while still recording (does not stop the recorder)
-  async uploadCurrentSegment(): Promise<void> {
-    if (!this.isRecording) return;
-    if (!this.mediaRecorder) return;
-    // Build a blob from the chunks collected so far
-    const pending = this.chunks;
-    if (!pending || pending.length === 0) return;
-    const blob = new Blob(pending, { type: this.chosenMimeType || 'audio/webm' });
-    // Compute segment duration based on time since last upload
-    const now = Date.now();
-    let duration = 0;
-    if (this.lastUploadAt) duration = Math.max(0, Math.floor((now - this.lastUploadAt) / 1000));
-    this.lastUploadAt = now;
-    // Reset chunks so subsequent data isn't re-uploaded
-    this.chunks = [];
-    // Perform upload if there is data
-    if (blob.size > 0) {
-      await this.uploadAudio(blob, duration);
-    }
-  }
-
   private cleanup(): void {
     if (this.stream) {
       this.stream.getTracks().forEach(track => {
@@ -192,7 +210,6 @@ export class AudioRecorder {
       this.stream = null;
     }
     this.mediaRecorder = null;
-    this.chunks = [];
     this.startTime = null;
     console.log('🧹 Audio recorder cleaned up');
   }

@@ -4,15 +4,11 @@ import { eq, desc, and, sql } from "drizzle-orm";
 import session from "express-session";
 import connectPg from "connect-pg-simple";
 import fs from "fs";
-import path, { dirname } from "path";
-import { fileURLToPath } from "url";
+import path from "path";
+import { getAudioBaseDir, getUserAudioDirKey, resolveFilePathFromUrl } from "./audio-paths";
 import type { IStorage } from "./storage";
 
 const PostgresSessionStore = connectPg(session);
-
-// ESM-safe __dirname
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
 
 export class DatabaseStorage implements IStorage {
   public sessionStore: session.Store;
@@ -161,22 +157,26 @@ export class DatabaseStorage implements IStorage {
 
   async enforceAudioStorageLimit(maxBytes: number): Promise<void> {
     let total = await this.getTotalAudioStorage();
+    const baseDir = getAudioBaseDir();
     while (total > maxBytes) {
       const oldest = await this.getOldestAudioRecording();
       if (!oldest) break;
 
       if (oldest.fileName) {
-        const filePath = path.join(
-          __dirname,
-          'uploads',
-          'audio',
-          oldest.userId,
-          oldest.fileName
-        );
-        try {
-          await fs.promises.unlink(filePath);
-        } catch (err) {
-          console.warn('File delete error:', err);
+        let filePath = resolveFilePathFromUrl(oldest.fileUrl);
+        if (!filePath) {
+          try {
+            const user = await this.getUser(oldest.userId);
+            const dirKey = getUserAudioDirKey(user ?? { id: oldest.userId });
+            filePath = path.join(baseDir, dirKey, oldest.fileName);
+          } catch {}
+        }
+        if (filePath) {
+          try {
+            await fs.promises.unlink(filePath);
+          } catch (err) {
+            console.warn('File delete error:', err);
+          }
         }
       }
 
@@ -264,7 +264,41 @@ export class DatabaseStorage implements IStorage {
   }
 
   async deleteUser(id: string): Promise<void> {
-    await db.delete(users).where(eq(users.id, id));
+    const fileCandidates: string[] = [];
+    const dirCandidates: string[] = [];
+
+    await db.transaction(async (tx) => {
+      const user = await tx.query.users.findFirst({ where: eq(users.id, id) });
+      if (!user) return;
+
+      dirCandidates.push(path.join(getAudioBaseDir(), getUserAudioDirKey(user as any)));
+
+      const audioRows = await tx
+        .select({ fileUrl: audioRecordings.fileUrl, fileName: audioRecordings.fileName })
+        .from(audioRecordings)
+        .where(eq(audioRecordings.userId, id));
+
+      for (const row of audioRows) {
+        const resolved = resolveFilePathFromUrl(row.fileUrl);
+        if (resolved) fileCandidates.push(resolved);
+        else if (row.fileName) {
+          fileCandidates.push(path.join(getAudioBaseDir(), getUserAudioDirKey(user as any), row.fileName));
+        }
+      }
+
+      await tx.delete(audioRecordings).where(eq(audioRecordings.userId, id));
+      await tx.delete(attendanceRecords).where(eq(attendanceRecords.userId, id));
+      await tx.delete(users).where(eq(users.id, id));
+    });
+
+    const uniqueFiles = Array.from(new Set(fileCandidates));
+    for (const filePath of uniqueFiles) {
+      try { await fs.promises.rm(filePath, { force: true }); } catch {}
+    }
+
+    for (const dirPath of Array.from(new Set(dirCandidates))) {
+      try { await fs.promises.rm(dirPath, { recursive: true, force: true }); } catch {}
+    }
   }
 
   async getMonthlyWorkHours(month: string): Promise<MonthlyWorkHoursResponse> {

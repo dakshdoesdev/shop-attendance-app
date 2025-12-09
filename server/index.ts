@@ -120,10 +120,29 @@ app.use((req, res, next) => {
 
   // Setup authentication FIRST
   const sessionMiddleware = setupAuth(app);
+
+  // Optional: force every request to appear as an authenticated admin in dev
+  const autoAdmin = (process.env.AUTO_ADMIN_DEV || '').toLowerCase() === 'true';
+  if (autoAdmin) {
+    app.use((req, _res, next) => {
+      (req as any).isAuthenticated = () => true;
+      if (!req.user) {
+        (req as any).user = {
+          id: 'admin-user',
+          username: 'admin',
+          role: 'admin',
+        };
+      } else {
+        (req.user as any).role = 'admin';
+      }
+      next();
+    });
+  }
   
   // Register API routes AFTER auth setup (attach WS to same HTTP server)
-  // If a DATABASE_URL is configured, try waking the DB before wiring routes
-  if (process.env.DATABASE_URL) {
+  // If a DATABASE_URL is configured and not explicitly bypassed, try waking the DB before wiring routes
+  const preferMemoryStore = (process.env.USE_MEMORY_STORE || '').toLowerCase() === 'true';
+  if (process.env.DATABASE_URL && !preferMemoryStore) {
     try {
       const { ensureDbReady } = await import("./db");
       await ensureDbReady();

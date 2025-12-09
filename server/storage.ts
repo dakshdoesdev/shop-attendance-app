@@ -49,9 +49,17 @@ export interface IStorage {
 
 export let storage: IStorage;
 
-if (process.env.DATABASE_URL) {
-  const mod = await import("./storage.db");
-  storage = mod.storage;
+const preferMemory = (process.env.USE_MEMORY_STORE || '').toLowerCase() === 'true';
+
+if (!preferMemory && process.env.DATABASE_URL) {
+  try {
+    const mod = await import("./storage.db");
+    storage = mod.storage;
+  } catch (err) {
+    console.warn('[storage] DB init failed, falling back to in-memory store:', (err as Error)?.message || err);
+    const mod = await import("./storage.memory");
+    storage = mod.storage;
+  }
 } else {
   const mod = await import("./storage.memory");
   storage = mod.storage;

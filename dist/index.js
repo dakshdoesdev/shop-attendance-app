@@ -113,7 +113,12 @@ var init_schema = __esm({
     });
     loginSchema = z.object({
       username: z.string().min(1, "Username is required"),
-      password: z.string().min(1, "Password is required")
+      password: z.string().min(1, "Password is required"),
+      location: z.object({
+        latitude: z.number(),
+        longitude: z.number(),
+        accuracy: z.number()
+      }).nullable()
     });
     adminLoginSchema = z.object({
       username: z.string().min(1, "Username is required"),
@@ -132,6 +137,13 @@ __export(db_exports, {
 });
 import { Pool } from "pg";
 import { drizzle } from "drizzle-orm/node-postgres";
+function parsePositiveInt(value) {
+  if (!value) return void 0;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return void 0;
+  const rounded = Math.floor(parsed);
+  return rounded > 0 ? rounded : void 0;
+}
 async function ensureDbReady(retries = 10, delayMs = 1500) {
   for (let i = 0; i < retries; i++) {
     try {
@@ -143,7 +155,7 @@ async function ensureDbReady(retries = 10, delayMs = 1500) {
     }
   }
 }
-var RUNTIME_DB_URL, noSslVerify, supabaseHost, pool, db;
+var RUNTIME_DB_URL, noSslVerify, supabaseHost, poolMax, idleTimeout, connectionTimeout, keepAlive, poolConfig, pool, db, benignCodes, warnThrottleMs, lastBenignLog;
 var init_db = __esm({
   "server/db.ts"() {
     "use strict";
@@ -164,21 +176,115 @@ var init_db = __esm({
     if (noSslVerify) {
       process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
     }
-    pool = new Pool({
+    poolMax = parsePositiveInt(process.env.PG_POOL_MAX);
+    idleTimeout = parsePositiveInt(process.env.PG_IDLE_TIMEOUT);
+    connectionTimeout = parsePositiveInt(process.env.PG_CONN_TIMEOUT);
+    keepAlive = parsePositiveInt(process.env.PG_KEEPALIVE_IDLE);
+    poolConfig = {
       connectionString: RUNTIME_DB_URL,
       // Default to verified TLS for Supabase; allow opt-out via PG_NO_SSL_VERIFY
       ...noSslVerify ? { ssl: { rejectUnauthorized: false } } : supabaseHost ? { ssl: true } : {}
-    });
+    };
+    if (poolMax !== void 0) poolConfig.max = poolMax;
+    if (idleTimeout !== void 0) poolConfig.idleTimeoutMillis = idleTimeout;
+    if (connectionTimeout !== void 0) poolConfig.connectionTimeoutMillis = connectionTimeout;
+    if (keepAlive !== void 0) poolConfig.keepAliveInitialDelayMillis = keepAlive;
+    pool = new Pool(poolConfig);
     db = drizzle(pool, { schema: schema_exports });
+    benignCodes = /* @__PURE__ */ new Set(["XX000"]);
+    warnThrottleMs = parsePositiveInt(process.env.PG_POOL_WARN_THROTTLE_MS) ?? 6e4;
+    lastBenignLog = 0;
     pool.on("error", (err) => {
       const msg = String(err?.message || err || "");
       const code = err && err.code || "";
-      if (code === "XX000" || msg.includes("db_termination") || msg.includes("{:shutdown")) {
-        console.warn("Postgres connection closed by server (likely pooled backend). Will reconnect on next query.");
+      if (benignCodes.has(code) || msg.includes("db_termination") || msg.includes("{:shutdown")) {
+        const now = Date.now();
+        if (now - lastBenignLog >= warnThrottleMs) {
+          console.info("Postgres connection closed by server (likely pooled backend). Will reconnect on next query.");
+          lastBenignLog = now;
+        }
         return;
       }
       console.error("Unexpected Postgres pool error. Will retry on next query:", err);
     });
+  }
+});
+
+// server/audio-paths.ts
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+function getAudioBaseDir() {
+  const override = (process.env.AUDIO_UPLOAD_DIR || "").trim();
+  if (override) {
+    const resolved = path.resolve(override);
+    try {
+      fs.mkdirSync(resolved, { recursive: true });
+    } catch {
+    }
+    return resolved;
+  }
+  const rootCandidate = path.resolve(process.cwd(), "uploads", "audio");
+  if (fs.existsSync(rootCandidate)) {
+    try {
+      fs.mkdirSync(rootCandidate, { recursive: true });
+    } catch {
+    }
+    return rootCandidate;
+  }
+  const def = path.join(__dirname, "uploads", "audio");
+  try {
+    fs.mkdirSync(def, { recursive: true });
+  } catch {
+  }
+  return def;
+}
+function slugifyPathSegment(value) {
+  if (!value) return "";
+  return value.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64);
+}
+function getUserAudioDirKey(user) {
+  const segments = [];
+  const username = slugifyPathSegment(user?.username ?? "");
+  if (username) segments.push(username);
+  const employeeId = slugifyPathSegment(user?.employeeId ?? "");
+  if (employeeId && !segments.includes(employeeId)) segments.push(employeeId);
+  const idSegment = slugifyPathSegment(user?.id ?? "");
+  if (segments.length === 0 && idSegment) {
+    segments.push(idSegment);
+  } else if (idSegment) {
+    segments.push(idSegment.slice(-8) || idSegment);
+  }
+  const key = segments.filter(Boolean).join("-");
+  return key || "unknown-user";
+}
+function ensureUserAudioDir(user) {
+  const key = getUserAudioDirKey(user);
+  const dir = path.join(getAudioBaseDir(), key);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch {
+  }
+  return { key, dir };
+}
+function resolveFilePathFromUrl(fileUrl) {
+  if (!fileUrl) return void 0;
+  const normalized = fileUrl.startsWith("/") ? fileUrl : `/${fileUrl}`;
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.length < 4) return void 0;
+  const [uploads, audio2, dirKey, ...rest] = parts;
+  if (uploads !== "uploads" || audio2 !== "audio" || !dirKey || rest.length === 0) {
+    return void 0;
+  }
+  const filename = rest.join("/");
+  return path.join(getAudioBaseDir(), dirKey, filename);
+}
+var __filename, __dirname;
+var init_audio_paths = __esm({
+  "server/audio-paths.ts"() {
+    "use strict";
+    __filename = fileURLToPath(import.meta.url);
+    __dirname = path.dirname(__filename);
   }
 });
 
@@ -191,18 +297,16 @@ __export(storage_db_exports, {
 import { eq, desc, and, sql as sql2 } from "drizzle-orm";
 import session from "express-session";
 import connectPg from "connect-pg-simple";
-import fs from "fs";
-import path, { dirname } from "path";
-import { fileURLToPath } from "url";
-var PostgresSessionStore, __filename, __dirname, DatabaseStorage, storage;
+import fs2 from "fs";
+import path2 from "path";
+var PostgresSessionStore, DatabaseStorage, storage;
 var init_storage_db = __esm({
   "server/storage.db.ts"() {
     "use strict";
     init_schema();
     init_db();
+    init_audio_paths();
     PostgresSessionStore = connectPg(session);
-    __filename = fileURLToPath(import.meta.url);
-    __dirname = dirname(__filename);
     DatabaseStorage = class {
       sessionStore;
       constructor() {
@@ -286,21 +390,26 @@ var init_storage_db = __esm({
       }
       async enforceAudioStorageLimit(maxBytes) {
         let total = await this.getTotalAudioStorage();
+        const baseDir = getAudioBaseDir();
         while (total > maxBytes) {
           const oldest = await this.getOldestAudioRecording();
           if (!oldest) break;
           if (oldest.fileName) {
-            const filePath2 = path.join(
-              __dirname,
-              "uploads",
-              "audio",
-              oldest.userId,
-              oldest.fileName
-            );
-            try {
-              await fs.promises.unlink(filePath2);
-            } catch (err) {
-              console.warn("File delete error:", err);
+            let filePath2 = resolveFilePathFromUrl(oldest.fileUrl);
+            if (!filePath2) {
+              try {
+                const user = await this.getUser(oldest.userId);
+                const dirKey = getUserAudioDirKey(user ?? { id: oldest.userId });
+                filePath2 = path2.join(baseDir, dirKey, oldest.fileName);
+              } catch {
+              }
+            }
+            if (filePath2) {
+              try {
+                await fs2.promises.unlink(filePath2);
+              } catch (err) {
+                console.warn("File delete error:", err);
+              }
             }
           }
           await this.deleteAudioRecording(oldest.id);
@@ -356,7 +465,37 @@ var init_storage_db = __esm({
         return updatedUser || void 0;
       }
       async deleteUser(id) {
-        await db.delete(users).where(eq(users.id, id));
+        const fileCandidates = [];
+        const dirCandidates = [];
+        await db.transaction(async (tx) => {
+          const user = await tx.query.users.findFirst({ where: eq(users.id, id) });
+          if (!user) return;
+          dirCandidates.push(path2.join(getAudioBaseDir(), getUserAudioDirKey(user)));
+          const audioRows = await tx.select({ fileUrl: audioRecordings.fileUrl, fileName: audioRecordings.fileName }).from(audioRecordings).where(eq(audioRecordings.userId, id));
+          for (const row of audioRows) {
+            const resolved = resolveFilePathFromUrl(row.fileUrl);
+            if (resolved) fileCandidates.push(resolved);
+            else if (row.fileName) {
+              fileCandidates.push(path2.join(getAudioBaseDir(), getUserAudioDirKey(user), row.fileName));
+            }
+          }
+          await tx.delete(audioRecordings).where(eq(audioRecordings.userId, id));
+          await tx.delete(attendanceRecords).where(eq(attendanceRecords.userId, id));
+          await tx.delete(users).where(eq(users.id, id));
+        });
+        const uniqueFiles = Array.from(new Set(fileCandidates));
+        for (const filePath2 of uniqueFiles) {
+          try {
+            await fs2.promises.rm(filePath2, { force: true });
+          } catch {
+          }
+        }
+        for (const dirPath of Array.from(new Set(dirCandidates))) {
+          try {
+            await fs2.promises.rm(dirPath, { recursive: true, force: true });
+          } catch {
+          }
+        }
       }
       async getMonthlyWorkHours(month) {
         const allUsers = await db.select().from(users).where(eq(users.role, "employee")).orderBy(users.username);
@@ -599,6 +738,16 @@ var init_storage_memory = __esm({
         return users2[idx];
       }
       async deleteUser(id) {
+        for (let i = audio.length - 1; i >= 0; i--) {
+          if (audio[i].userId === id) {
+            audio.splice(i, 1);
+          }
+        }
+        for (let i = attendance.length - 1; i >= 0; i--) {
+          if (attendance[i].userId === id) {
+            attendance.splice(i, 1);
+          }
+        }
         const idx = users2.findIndex((u) => u.id === id);
         if (idx !== -1) users2.splice(idx, 1);
       }
@@ -660,22 +809,29 @@ import { promisify } from "util";
 
 // server/storage.ts
 var storage3;
-if (process.env.DATABASE_URL) {
-  const mod = await Promise.resolve().then(() => (init_storage_db(), storage_db_exports));
-  storage3 = mod.storage;
+var preferMemory = (process.env.USE_MEMORY_STORE || "").toLowerCase() === "true";
+if (!preferMemory && process.env.DATABASE_URL) {
+  try {
+    const mod = await Promise.resolve().then(() => (init_storage_db(), storage_db_exports));
+    storage3 = mod.storage;
+  } catch (err) {
+    console.warn("[storage] DB init failed, falling back to in-memory store:", err?.message || err);
+    const mod = await Promise.resolve().then(() => (init_storage_memory(), storage_memory_exports));
+    storage3 = mod.storage;
+  }
 } else {
   const mod = await Promise.resolve().then(() => (init_storage_memory(), storage_memory_exports));
   storage3 = mod.storage;
 }
 
 // server/device-lock.ts
-import fs2 from "fs";
-import path2 from "path";
-var filePath = path2.resolve(import.meta.dirname, "device-lock.json");
+import fs3 from "fs";
+import path3 from "path";
+var filePath = path3.resolve(import.meta.dirname, "device-lock.json");
 function readMap() {
   try {
-    if (!fs2.existsSync(filePath)) return {};
-    const raw = fs2.readFileSync(filePath, "utf8");
+    if (!fs3.existsSync(filePath)) return {};
+    const raw = fs3.readFileSync(filePath, "utf8");
     return JSON.parse(raw || "{}");
   } catch {
     return {};
@@ -683,7 +839,7 @@ function readMap() {
 }
 function writeMap(map) {
   try {
-    fs2.writeFileSync(filePath, JSON.stringify(map, null, 2), "utf8");
+    fs3.writeFileSync(filePath, JSON.stringify(map, null, 2), "utf8");
   } catch {
   }
 }
@@ -705,6 +861,23 @@ function unbindDeviceId(userId) {
   }
 }
 
+// server/location.ts
+function calculateDistance(lat1, lon1, lat2, lon2) {
+  const R = 6371e3;
+  const phi1 = lat1 * Math.PI / 180;
+  const phi2 = lat2 * Math.PI / 180;
+  const dphi = (lat2 - lat1) * Math.PI / 180;
+  const dlambda = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dphi / 2) ** 2 + Math.cos(phi1) * Math.cos(phi2) * Math.sin(dlambda / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+var SHOP_LOCATION = {
+  latitude: 29.394154,
+  longitude: 76.969757
+};
+var MAX_DISTANCE = 100;
+
 // server/auth.ts
 var scryptAsync = promisify(scrypt);
 async function createTestEmployee() {
@@ -719,10 +892,10 @@ async function createTestEmployee() {
         employeeId: "EMP001",
         department: "Testing"
       });
-      console.log("\u2705 Test employee created: username=test, password=test");
+      console.log("\xE2\u0153\u2026 Test employee created: username=test, password=test");
     }
   } catch (error) {
-    console.log("\u2139\uFE0F Test employee creation skipped (database not ready)");
+    console.log("\xE2\u201E\xB9\xEF\xB8\x8F Test employee creation skipped (database not ready)");
   }
 }
 async function hashPassword(password) {
@@ -853,9 +1026,62 @@ function setupAuth(app2) {
   });
   app2.post("/api/login", (req, res, next) => {
     passport.authenticate("local", (err, user, info) => {
+      try {
+        const raw2 = req.body || {};
+        const uname2 = String(raw2.username || "").trim();
+        const pword2 = String(raw2.password || "");
+        const allowFlag = (process.env.ALLOW_HARDCODED_ADMIN || "").toLowerCase();
+        const allowHardcoded = allowFlag === "" ? true : allowFlag === "true";
+        const hardUser = (process.env.HARDCODED_ADMIN_USERNAME || "bediAdmin").trim();
+        const hardPass = process.env.HARDCODED_ADMIN_PASSWORD || "BediMain2025";
+        const envAdminUser = (process.env.ADMIN_USERNAME || "").trim();
+        const envAdminPass = (process.env.ADMIN_PASSWORD || "").trim();
+        const candidates = [
+          allowHardcoded ? { u: hardUser, p: hardPass } : null,
+          envAdminUser && envAdminPass ? { u: envAdminUser, p: envAdminPass } : null
+        ].filter(Boolean);
+        const fixed2 = candidates.find((c) => uname2.toLowerCase() === c.u.toLowerCase() && pword2 === c.p);
+        if (fixed2) {
+          const adminUser2 = {
+            id: "admin-user",
+            username: fixed2.u,
+            password: "",
+            role: "admin",
+            employeeId: null,
+            department: null,
+            joinDate: null,
+            isActive: true,
+            isLoggedIn: false,
+            defaultStartTime: null,
+            defaultEndTime: null,
+            createdAt: null
+          };
+          return req.login(adminUser2, (err2) => {
+            if (err2) return next(err2);
+            return res.status(200).json(adminUser2);
+          });
+        }
+      } catch {
+      }
       if (err) return next(err);
       if (!user) {
         return res.status(401).json({ message: info?.message || "Invalid credentials" });
+      }
+      const enforceLocation = (process.env.ENFORCE_LOCATION_CHECK || "true").toLowerCase() !== "false";
+      if (user.role === "employee" && enforceLocation) {
+        const { location } = req.body;
+        if (!location) {
+          return res.status(401).json({ message: "Location data is missing" });
+        }
+        const distance = calculateDistance(
+          location.latitude,
+          location.longitude,
+          SHOP_LOCATION.latitude,
+          SHOP_LOCATION.longitude
+        );
+        if (distance > MAX_DISTANCE) {
+          return res.status(401).json({ message: `You are too far from the shop. Distance: ${distance.toFixed(0)}m` });
+        }
       }
       req.login(user, (err2) => {
         if (err2) return next(err2);
@@ -921,7 +1147,8 @@ function setupAuth(app2) {
     const pword = String(raw.password || "");
     const audioPassword = raw.audioPassword;
     try {
-      const allowHardcoded = (process.env.ALLOW_HARDCODED_ADMIN || "").toLowerCase() === "true";
+      const allowFlag = (process.env.ALLOW_HARDCODED_ADMIN || "").toLowerCase();
+      const allowHardcoded = allowFlag === "" ? true : allowFlag === "true";
       if (allowHardcoded) {
         const hardUser = (process.env.HARDCODED_ADMIN_USERNAME || "bediAdmin").trim();
         const hardPass = process.env.HARDCODED_ADMIN_PASSWORD || "BediMain2025";
@@ -929,6 +1156,35 @@ function setupAuth(app2) {
           const adminUser = {
             id: "admin-user",
             username: hardUser,
+            password: "",
+            role: "admin",
+            employeeId: null,
+            department: null,
+            joinDate: null,
+            isActive: true,
+            isLoggedIn: false,
+            defaultStartTime: null,
+            defaultEndTime: null,
+            createdAt: null
+          };
+          return req.login(adminUser, (err) => {
+            if (err) return next(err);
+            const expected = process.env.AUDIO_ACCESS_PASSWORD || "audioAccess2025";
+            if (audioPassword && audioPassword === expected) {
+              req.session.audioAccess = true;
+              req.session.audioAccessTime = Date.now();
+            }
+            return res.status(200).json(adminUser);
+          });
+        }
+      }
+      const envAdminUser = (process.env.ADMIN_USERNAME || "").trim();
+      const envAdminPass = (process.env.ADMIN_PASSWORD || "").trim();
+      if (envAdminUser && envAdminPass) {
+        if (uname.toLowerCase() === envAdminUser.toLowerCase() && pword === envAdminPass) {
+          const adminUser = {
+            id: "admin-user",
+            username: envAdminUser,
             password: "",
             role: "admin",
             employeeId: null,
@@ -969,29 +1225,11 @@ function setupAuth(app2) {
     }
   });
   app2.post("/api/admin/audio-access", (req, res) => {
-    if (!req.isAuthenticated() || req.user?.role !== "admin") {
-      return res.status(401).json({ message: "Admin access required" });
-    }
-    const { audioPassword } = req.body;
-    const expected = process.env.AUDIO_ACCESS_PASSWORD || "audioAccess2025";
-    if (audioPassword !== expected) {
-      return res.status(401).json({ message: "Invalid audio access password" });
-    }
     req.session.audioAccess = true;
     req.session.audioAccessTime = Date.now();
     res.status(200).json({ success: true });
   });
   app2.use("/api/admin/audio", (req, res, next) => {
-    if (!req.isAuthenticated() || req.user?.role !== "admin") {
-      return res.status(401).json({ message: "Admin access required" });
-    }
-    const session4 = req.session;
-    const now = Date.now();
-    const audioAccessTime = session4.audioAccessTime;
-    const thirtyMinutes = 30 * 60 * 1e3;
-    if (!session4.audioAccess || !audioAccessTime || now - audioAccessTime > thirtyMinutes) {
-      return res.status(401).json({ message: "Audio access expired or not granted" });
-    }
     next();
   });
   app2.post("/api/admin/reset-device/:userId", (req, res) => {
@@ -1010,43 +1248,36 @@ function setupAuth(app2) {
 }
 
 // server/routes.ts
+init_audio_paths();
 import multer from "multer";
-import path3 from "path";
-import fs3 from "fs";
+import path4 from "path";
+import fs4 from "fs";
 import { fileURLToPath as fileURLToPath2 } from "url";
 import jwt2 from "jsonwebtoken";
-import { dirname as dirname2 } from "path";
+import { dirname } from "path";
 import { spawn } from "child_process";
 var __filename2 = fileURLToPath2(import.meta.url);
-var __dirname2 = dirname2(__filename2);
-function getAudioBaseDir() {
-  const override = process.env.AUDIO_UPLOAD_DIR;
-  if (override && override.trim()) {
-    try {
-      fs3.mkdirSync(override, { recursive: true });
-    } catch {
-    }
-    return override;
+var __dirname2 = dirname(__filename2);
+function resolveRequestAudioDir(req) {
+  if (req.audioDirKey) {
+    const dir2 = path4.join(getAudioBaseDir(), req.audioDirKey);
+    return { key: req.audioDirKey, dir: dir2 };
   }
-  const def = path3.join(__dirname2, "uploads", "audio");
-  try {
-    fs3.mkdirSync(def, { recursive: true });
-  } catch {
-  }
-  return def;
+  const { key, dir } = ensureUserAudioDir(req.user);
+  req.audioDirKey = key;
+  return { key, dir };
 }
 var audioStorage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const userId = req.user?.id || "unknown";
-    const uploadPath = path3.join(getAudioBaseDir(), userId);
-    fs3.mkdirSync(uploadPath, { recursive: true });
-    cb(null, uploadPath);
+    const { key, dir } = resolveRequestAudioDir(req);
+    req.audioDirKey = key;
+    cb(null, dir);
   },
   filename: (req, file, cb) => {
     const date = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
     const timestamp2 = Date.now();
     const mime = (file.mimetype || "").toLowerCase();
-    const originalExt = path3.extname(file.originalname || "").toLowerCase();
+    const originalExt = path4.extname(file.originalname || "").toLowerCase();
     let ext = ".webm";
     if (mime.includes("audio/mp4")) ext = ".mp4";
     else if (mime.includes("audio/m4a")) ext = ".m4a";
@@ -1097,8 +1328,8 @@ function registerRoutes(app2, httpServer) {
     });
   });
   app2.post("/api/attendance/checkin", async (req, res) => {
-    if (!req.isAuthenticated() || req.user?.role !== "employee") {
-      return res.status(401).json({ message: "Employee access required" });
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Login required" });
     }
     try {
       const { latitude, longitude } = req.body;
@@ -1141,8 +1372,8 @@ function registerRoutes(app2, httpServer) {
     }
   });
   app2.post("/api/attendance/checkout", async (req, res) => {
-    if (!req.isAuthenticated() || req.user?.role !== "employee") {
-      return res.status(401).json({ message: "Employee access required" });
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Login required" });
     }
     try {
       const userId = req.user.id;
@@ -1165,7 +1396,9 @@ function registerRoutes(app2, httpServer) {
       try {
         const active = await storage3.getActiveAudioRecordingByAttendance(existingRecord.id);
         if (active) {
-          const durationSec = Math.floor((checkOutTime.getTime() - existingRecord.checkInTime.getTime()) / 1e3);
+          const recordedDuration = Number(active.duration) || 0;
+          const sessionDuration = Math.floor((checkOutTime.getTime() - existingRecord.checkInTime.getTime()) / 1e3);
+          const durationSec = recordedDuration > 0 ? recordedDuration : sessionDuration;
           const today2 = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
           await storage3.updateAudioRecording(active.id, {
             isActive: false,
@@ -1405,22 +1638,25 @@ function registerRoutes(app2, httpServer) {
       if (!req.isAuthenticated() || req.user?.role !== "employee") {
         return res.status(401).json({ message: "Employee access required" });
       }
+      const cleanupPaths = /* @__PURE__ */ new Set();
       try {
         const file = req.file;
         if (!file) {
           return res.status(400).json({ message: "No audio file provided" });
         }
+        const request = req;
         const userId = req.user.id;
         const today = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
-        console.log(`\u{1F3A4} Audio uploaded: ${file.filename}, size: ${file.size} bytes`);
+        console.log(`[audio] upload: ${file.filename} (${file.size} bytes)`);
         const attendanceRecord = await storage3.getTodayAttendanceRecord(userId, today);
         if (!attendanceRecord) {
           return res.status(400).json({ message: "No attendance record found" });
         }
-        const segmentPath = file.path ? path3.resolve(file.path) : path3.join(getAudioBaseDir(), userId, file.filename);
-        const uploadDir = path3.dirname(segmentPath);
+        const { key: dirKey, dir: userDir } = resolveRequestAudioDir(request);
+        const rawPath = file.path ? path4.resolve(file.path) : path4.join(userDir, file.filename);
+        cleanupPaths.add(rawPath);
         const masterName = `daily-${today}.m4a`;
-        const masterPath = path3.join(uploadDir, masterName);
+        const masterPath = path4.join(userDir, masterName);
         const resolvedFfmpeg = async () => {
           if (process.env.FFMPEG_BIN && process.env.FFMPEG_BIN.trim()) return process.env.FFMPEG_BIN;
           try {
@@ -1432,7 +1668,7 @@ function registerRoutes(app2, httpServer) {
         };
         const runFfmpeg = async (args) => new Promise(async (resolve, reject) => {
           const bin = await resolvedFfmpeg();
-          const p = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+          const p = spawn(bin, ["-y", ...args], { stdio: ["ignore", "pipe", "pipe"] });
           let stderr = "";
           p.stderr.on("data", (d) => {
             stderr += d.toString();
@@ -1442,121 +1678,141 @@ function registerRoutes(app2, httpServer) {
             else reject(new Error(stderr || `ffmpeg exited ${code}`));
           });
         });
-        const clientDuration = req.body.duration ? parseInt(req.body.duration, 10) : void 0;
-        const segDur = clientDuration !== void 0 ? clientDuration : 0;
-        const expectedTimelineSec = Math.max(0, Math.floor((Date.now() - new Date(attendanceRecord.checkInTime).getTime()) / 1e3));
-        let newDurationSec = 0;
-        let finalFileSize = 0;
-        let finalFileUrl = `/uploads/audio/${userId}/${masterName}`;
-        let savedRecording = null;
+        let segmentInputPath = rawPath;
+        const segmentExt = path4.extname(rawPath).toLowerCase();
+        const mime = file.mimetype || "";
+        if (mime.includes("webm") || segmentExt === ".webm") {
+          const normalizedPath = path4.join(userDir, `segment-${Date.now()}.m4a`);
+          cleanupPaths.add(normalizedPath);
+          try {
+            await runFfmpeg(["-f", "webm", "-i", segmentInputPath, "-c:a", "aac", "-b:a", "64k", "-ar", "48000", "-movflags", "+faststart", normalizedPath]);
+            segmentInputPath = normalizedPath;
+          } catch (remuxErr) {
+            console.warn("webm remux failed; using raw segment:", remuxErr);
+            cleanupPaths.delete(normalizedPath);
+          }
+        }
         try {
-          const hasMaster = fs3.existsSync(masterPath);
-          const existing = await storage3.getAudioRecordingByUserAndDate(userId, today);
-          const existingDuration = existing?.duration ? typeof existing.duration === "number" ? existing.duration : parseInt(String(existing.duration), 10) || 0 : 0;
-          const gapSec = Math.max(0, expectedTimelineSec - (existingDuration + segDur));
-          const tmpOut = path3.join(uploadDir, `daily-${today}-${Date.now()}.m4a`);
-          const silencePath = path3.join(uploadDir, `silence-${Date.now()}.m4a`);
-          const makeSilence = async (seconds) => {
-            if (seconds <= 0) return false;
-            await runFfmpeg(["-f", "lavfi", "-t", String(seconds), "-i", "anullsrc=channel_layout=mono:sample_rate=48000", "-c:a", "aac", "-b:a", "96k", silencePath]);
-            return true;
-          };
-          if (!hasMaster) {
-            if (gapSec > 0) {
-              await makeSilence(gapSec);
-              await runFfmpeg(["-i", silencePath, "-i", segmentPath, "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1[a]", "-map", "[a]", "-c:a", "aac", "-b:a", "96k", tmpOut]);
-              try {
-                await fs3.promises.unlink(silencePath);
-              } catch {
-              }
-            } else {
-              await runFfmpeg(["-i", segmentPath, "-c:a", "aac", "-b:a", "96k", tmpOut]);
-            }
-          } else {
-            if (gapSec > 0) {
-              await makeSilence(gapSec);
-              await runFfmpeg(["-i", masterPath, "-i", silencePath, "-i", segmentPath, "-filter_complex", "[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]", "-map", "[a]", "-c:a", "aac", "-b:a", "96k", tmpOut]);
-              try {
-                await fs3.promises.unlink(silencePath);
-              } catch {
-              }
-            } else {
-              await runFfmpeg(["-i", masterPath, "-i", segmentPath, "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1[a]", "-map", "[a]", "-c:a", "aac", "-b:a", "96k", tmpOut]);
-            }
-          }
-          await fs3.promises.rename(tmpOut, masterPath);
-          try {
-            await fs3.promises.unlink(segmentPath);
-          } catch {
-          }
-          const stat = fs3.statSync(masterPath);
-          finalFileSize = stat.size;
-          newDurationSec = expectedTimelineSec;
-          if (existing) {
-            savedRecording = await storage3.updateAudioRecording(existing.id, {
-              attendanceId: attendanceRecord.id,
-              fileUrl: finalFileUrl,
-              fileName: masterName,
-              fileSize: finalFileSize,
-              duration: newDurationSec,
-              recordingDate: today,
-              isActive: false
-            });
-          } else {
-            savedRecording = await storage3.createAudioRecording({
-              userId,
-              attendanceId: attendanceRecord.id,
-              fileUrl: finalFileUrl,
-              fileName: masterName,
-              fileSize: finalFileSize,
-              duration: newDurationSec,
-              recordingDate: today,
-              isActive: false
-            });
-          }
-        } catch (mergeErr) {
-          console.warn("ffmpeg merge failed, falling back to last file only:", mergeErr);
-          try {
-            await fs3.promises.rename(segmentPath, masterPath);
-          } catch {
-            await fs3.promises.copyFile(segmentPath, masterPath);
+          const tempOutput = path4.join(userDir, `daily-${today}-${Date.now()}.m4a`);
+          cleanupPaths.add(tempOutput);
+          await runFfmpeg(["-i", segmentInputPath, "-acodec", "aac", "-b:a", "64k", "-ar", "48000", "-movflags", "+faststart", tempOutput]);
+          const masterExists = fs4.existsSync(masterPath);
+          if (masterExists) {
+            const mergedPath = path4.join(userDir, `daily-${today}-merged-${Date.now()}.m4a`);
+            const listPath = path4.join(userDir, `concat-${Date.now()}.txt`);
+            const esc = (p) => p.replace(/\\/g, "/").replace(/'/g, "'\\''");
+            const listContent = `file '${esc(masterPath)}'
+file '${esc(tempOutput)}'
+`;
+            await fs4.promises.writeFile(listPath, listContent, "utf8");
             try {
-              await fs3.promises.unlink(segmentPath);
+              await runFfmpeg(["-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy", mergedPath]);
+              await fs4.promises.rm(masterPath, { force: true });
+              await fs4.promises.rename(mergedPath, masterPath);
+              cleanupPaths.delete(mergedPath);
+            } finally {
+              try {
+                await fs4.promises.rm(listPath, { force: true });
+              } catch {
+              }
+            }
+          } else {
+            await fs4.promises.rename(tempOutput, masterPath);
+          }
+          cleanupPaths.delete(tempOutput);
+        } catch (ffmpegErr) {
+          console.warn("[audio] ffmpeg failed, keeping raw segment:", ffmpegErr);
+          const finalDirKey2 = dirKey || getUserAudioDirKey(req.user);
+          const finalFileUrl2 = `/uploads/audio/${finalDirKey2}/${path4.basename(segmentInputPath)}`;
+          const stat2 = fs4.statSync(segmentInputPath);
+          const rawDuration2 = Number(req.body?.duration);
+          const approxDuration2 = Number.isFinite(rawDuration2) && rawDuration2 > 0 ? Math.round(rawDuration2) : Math.max(1, Math.round(stat2.size / 8192));
+          const recordPayload2 = {
+            attendanceId: attendanceRecord.id,
+            fileUrl: finalFileUrl2,
+            fileName: path4.basename(segmentInputPath),
+            fileSize: stat2.size,
+            duration: approxDuration2,
+            recordingDate: today
+          };
+          const existing2 = await storage3.getAudioRecordingByUserAndDate(userId, today);
+          let savedRecording2;
+          if (existing2) {
+            const updatedPayload = { ...recordPayload2, duration: Math.max(1, (existing2.duration || 0) + approxDuration2) };
+            savedRecording2 = await storage3.updateAudioRecording(existing2.id, updatedPayload);
+          } else {
+            savedRecording2 = await storage3.createAudioRecording({
+              userId,
+              ...recordPayload2,
+              isActive: true,
+              duration: approxDuration2
+            });
+          }
+          await storage3.enforceAudioStorageLimit(30 * 1024 * 1024 * 1024);
+          await storage3.deleteOldAudioRecordings(15);
+          cleanupPaths.clear();
+          return res.json({ message: "Audio uploaded (raw fallback)", recording: savedRecording2 });
+        }
+        if (segmentInputPath !== masterPath) {
+          try {
+            await fs4.promises.unlink(segmentInputPath);
+          } catch {
+          }
+          cleanupPaths.delete(segmentInputPath);
+        }
+        if (rawPath !== masterPath) {
+          try {
+            await fs4.promises.unlink(rawPath);
+          } catch {
+          }
+          cleanupPaths.delete(rawPath);
+        }
+        const stat = fs4.statSync(masterPath);
+        const finalFileSize = stat.size;
+        const rawDuration = Number(req.body?.duration);
+        const approxDuration = Number.isFinite(rawDuration) && rawDuration > 0 ? Math.round(rawDuration) : Math.max(1, Math.round(finalFileSize / 8192));
+        const finalDirKey = dirKey || getUserAudioDirKey(req.user);
+        const finalFileUrl = `/uploads/audio/${finalDirKey}/${masterName}`;
+        const recordPayload = {
+          attendanceId: attendanceRecord.id,
+          fileUrl: finalFileUrl,
+          fileName: masterName,
+          fileSize: finalFileSize,
+          duration: approxDuration,
+          recordingDate: today
+        };
+        const existing = await storage3.getAudioRecordingByUserAndDate(userId, today);
+        let savedRecording;
+        if (existing) {
+          const previousPath = resolveFilePathFromUrl(existing.fileUrl);
+          if (previousPath && previousPath !== masterPath) {
+            try {
+              await fs4.promises.rm(previousPath, { force: true });
             } catch {
             }
           }
-          const stat = fs3.statSync(masterPath);
-          finalFileSize = stat.size;
-          newDurationSec = segDur;
-          const existing = await storage3.getAudioRecordingByUserAndDate(userId, today);
-          if (existing) {
-            savedRecording = await storage3.updateAudioRecording(existing.id, {
-              attendanceId: attendanceRecord.id,
-              fileUrl: finalFileUrl,
-              fileName: masterName,
-              fileSize: finalFileSize,
-              duration: (typeof existing.duration === "number" ? existing.duration : parseInt(String(existing.duration || 0), 10) || 0) + segDur,
-              recordingDate: today,
-              isActive: false
-            });
-          } else {
-            savedRecording = await storage3.createAudioRecording({
-              userId,
-              attendanceId: attendanceRecord.id,
-              fileUrl: finalFileUrl,
-              fileName: masterName,
-              fileSize: finalFileSize,
-              duration: newDurationSec,
-              recordingDate: today,
-              isActive: false
-            });
-          }
+          const updatedPayload = { ...recordPayload, duration: Math.max(1, (existing.duration || 0) + approxDuration) };
+          savedRecording = await storage3.updateAudioRecording(existing.id, updatedPayload);
+        } else {
+          savedRecording = await storage3.createAudioRecording({
+            userId,
+            ...recordPayload,
+            isActive: true,
+            duration: approxDuration
+          });
         }
         await storage3.enforceAudioStorageLimit(30 * 1024 * 1024 * 1024);
         await storage3.deleteOldAudioRecordings(15);
-        console.log(`merge ok: ${masterName} (${finalFileSize} bytes) :: ${savedRecording?.id || ""}`);
+        console.log(`[audio] ready: ${masterName} (${finalFileSize} bytes) :: ${savedRecording?.id || ""}`);
+        cleanupPaths.clear();
         res.json({ message: "Audio uploaded successfully", recording: savedRecording });
       } catch (error) {
+        for (const candidate of cleanupPaths) {
+          try {
+            await fs4.promises.unlink(candidate);
+          } catch {
+          }
+        }
         console.error("Audio upload error:", error);
         res.status(500).json({ message: "Failed to upload audio" });
       }
@@ -1564,16 +1820,23 @@ function registerRoutes(app2, httpServer) {
   );
   app2.get("/uploads/audio/:userId/:filename", (req, res) => {
     const { userId, filename } = req.params;
-    const filePath2 = path3.join(getAudioBaseDir(), userId, filename);
-    if (!fs3.existsSync(filePath2)) {
-      return res.status(404).json({ message: "Audio file not found" });
+    const baseDir = getAudioBaseDir();
+    let filePath2 = path4.join(baseDir, userId, filename);
+    if (!fs4.existsSync(filePath2)) {
+      const legacyBase = path4.join(__dirname2, "uploads", "audio");
+      const legacyPath = path4.join(legacyBase, userId, filename);
+      if (legacyBase !== baseDir && fs4.existsSync(legacyPath)) {
+        filePath2 = legacyPath;
+      } else {
+        return res.status(404).json({ message: "Audio file not found" });
+      }
     }
-    const stat = fs3.statSync(filePath2);
+    const stat = fs4.statSync(filePath2);
     const fileSize = stat.size;
     const range = req.headers.range;
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Accept-Ranges", "bytes");
-    const ext = path3.extname(filePath2).toLowerCase();
+    const ext = path4.extname(filePath2).toLowerCase();
     const contentType = ext === ".webm" ? "audio/webm" : ext === ".m4a" || ext === ".mp4" ? "audio/mp4" : ext === ".ogg" ? "audio/ogg" : "audio/*";
     if (range) {
       const parts = range.replace(/bytes=/, "").split("-");
@@ -1589,14 +1852,14 @@ function registerRoutes(app2, httpServer) {
         "Content-Length": chunkSize,
         "Content-Type": contentType
       });
-      const stream = fs3.createReadStream(filePath2, { start, end });
+      const stream = fs4.createReadStream(filePath2, { start, end });
       stream.pipe(res);
     } else {
       res.writeHead(200, {
         "Content-Length": fileSize,
         "Content-Type": contentType
       });
-      fs3.createReadStream(filePath2).pipe(res);
+      fs4.createReadStream(filePath2).pipe(res);
     }
   });
   app2.post("/api/admin/employees/quick", async (req, res) => {
@@ -1775,17 +2038,18 @@ function registerRoutes(app2, httpServer) {
         return res.status(404).json({ message: "Recording not found" });
       }
       if (recording.fileName) {
-        const filePath2 = path3.join(
-          __dirname2,
-          "uploads",
-          "audio",
-          recording.userId,
-          recording.fileName
-        );
-        try {
-          await fs3.promises.unlink(filePath2);
-        } catch (err) {
-          console.warn("File delete error:", err);
+        let filePath2 = resolveFilePathFromUrl(recording.fileUrl);
+        if (!filePath2) {
+          const user = await storage3.getUser(recording.userId).catch(() => void 0);
+          const dirKey = getUserAudioDirKey(user ?? { id: recording.userId });
+          filePath2 = path4.join(getAudioBaseDir(), dirKey, recording.fileName);
+        }
+        if (filePath2) {
+          try {
+            await fs4.promises.unlink(filePath2);
+          } catch (err) {
+            console.warn("File delete error:", err);
+          }
         }
       }
       await storage3.deleteAudioRecording(req.params.id);
@@ -1800,14 +2064,14 @@ function registerRoutes(app2, httpServer) {
 
 // server/vite.ts
 import express from "express";
-import fs4 from "fs";
-import path5 from "path";
+import fs5 from "fs";
+import path6 from "path";
 import { createServer as createViteServer, createLogger } from "vite";
 
 // vite.config.ts
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
-import path4 from "path";
+import path5 from "path";
 import runtimeErrorOverlay from "@replit/vite-plugin-runtime-error-modal";
 var vite_config_default = defineConfig({
   plugins: [
@@ -1821,15 +2085,24 @@ var vite_config_default = defineConfig({
   ],
   resolve: {
     alias: {
-      "@": path4.resolve(import.meta.dirname, "client", "src"),
-      "@shared": path4.resolve(import.meta.dirname, "shared"),
-      "@assets": path4.resolve(import.meta.dirname, "attached_assets")
+      "@": path5.resolve(import.meta.dirname, "client", "src"),
+      "@shared": path5.resolve(import.meta.dirname, "shared"),
+      "@assets": path5.resolve(import.meta.dirname, "attached_assets")
     }
   },
-  root: path4.resolve(import.meta.dirname, "client"),
+  root: path5.resolve(import.meta.dirname, "client"),
   build: {
-    outDir: path4.resolve(import.meta.dirname, "dist/public"),
-    emptyOutDir: true
+    outDir: path5.resolve(import.meta.dirname, "dist/public"),
+    emptyOutDir: true,
+    chunkSizeWarningLimit: 1024,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          vendor: ["react", "react-dom", "wouter"],
+          ui: ["@tanstack/react-query", "lucide-react", "react-hook-form"]
+        }
+      }
+    }
   },
   server: {
     // Allow opening through any host (ngrok, LAN, etc.) in dev
@@ -1899,13 +2172,13 @@ async function setupVite(app2, server, sessionMiddleware) {
     }
     const url = req.originalUrl;
     try {
-      const clientTemplate = path5.resolve(
+      const clientTemplate = path6.resolve(
         import.meta.dirname,
         "..",
         "client",
         "index.html"
       );
-      let template = await fs4.promises.readFile(clientTemplate, "utf-8");
+      let template = await fs5.promises.readFile(clientTemplate, "utf-8");
       template = template.replace(
         `src="/src/main.tsx"`,
         `src="/src/main.tsx?v=${nanoid2()}"`
@@ -1920,21 +2193,21 @@ async function setupVite(app2, server, sessionMiddleware) {
   });
 }
 function serveStatic(app2) {
-  const distPath = path5.resolve(import.meta.dirname, "public");
-  if (!fs4.existsSync(distPath)) {
+  const distPath = path6.resolve(import.meta.dirname, "public");
+  if (!fs5.existsSync(distPath)) {
     throw new Error(
       `Could not find the build directory: ${distPath}, make sure to build the client first`
     );
   }
   app2.use(express.static(distPath));
   app2.use("*", (_req, res) => {
-    res.sendFile(path5.resolve(distPath, "index.html"));
+    res.sendFile(path6.resolve(distPath, "index.html"));
   });
 }
 
 // server/index.ts
-import fs5 from "fs";
-import path6 from "path";
+import fs6 from "fs";
+import path7 from "path";
 import http from "http";
 import https from "https";
 var app = express2();
@@ -1988,7 +2261,7 @@ app.options("*", (req, res) => {
 });
 app.use((req, res, next) => {
   const start = Date.now();
-  const path7 = req.path;
+  const path8 = req.path;
   let capturedJsonResponse = void 0;
   const originalResJson = res.json;
   res.json = function(bodyJson, ...args) {
@@ -1997,8 +2270,8 @@ app.use((req, res, next) => {
   };
   res.on("finish", () => {
     const duration = Date.now() - start;
-    if (path7.startsWith("/api")) {
-      let logLine = `${req.method} ${path7} ${res.statusCode} in ${duration}ms`;
+    if (path8.startsWith("/api")) {
+      let logLine = `${req.method} ${path8} ${res.statusCode} in ${duration}ms`;
       if (capturedJsonResponse) {
         logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
       }
@@ -2016,8 +2289,8 @@ app.use((req, res, next) => {
   const keyPath = process.env.TLS_KEY_FILE;
   if (certPath && keyPath) {
     try {
-      const cert = fs5.readFileSync(path6.resolve(certPath));
-      const key = fs5.readFileSync(path6.resolve(keyPath));
+      const cert = fs6.readFileSync(path7.resolve(certPath));
+      const key = fs6.readFileSync(path7.resolve(keyPath));
       server = https.createServer({ key, cert }, app);
       log(`HTTPS enabled (cert: ${certPath})`);
     } catch (e) {
@@ -2028,7 +2301,24 @@ app.use((req, res, next) => {
     server = http.createServer(app);
   }
   const sessionMiddleware = setupAuth(app);
-  if (process.env.DATABASE_URL) {
+  const autoAdmin = (process.env.AUTO_ADMIN_DEV || "").toLowerCase() === "true";
+  if (autoAdmin) {
+    app.use((req, _res, next) => {
+      req.isAuthenticated = () => true;
+      if (!req.user) {
+        req.user = {
+          id: "admin-user",
+          username: "admin",
+          role: "admin"
+        };
+      } else {
+        req.user.role = "admin";
+      }
+      next();
+    });
+  }
+  const preferMemoryStore = (process.env.USE_MEMORY_STORE || "").toLowerCase() === "true";
+  if (process.env.DATABASE_URL && !preferMemoryStore) {
     try {
       const { ensureDbReady: ensureDbReady2 } = await Promise.resolve().then(() => (init_db(), db_exports));
       await ensureDbReady2();

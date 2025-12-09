@@ -27,6 +27,15 @@ export default defineConfig({
   build: {
     outDir: path.resolve(import.meta.dirname, "dist/public"),
     emptyOutDir: true,
+    chunkSizeWarningLimit: 1024,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          vendor: ["react", "react-dom", "wouter"],
+          ui: ["@tanstack/react-query", "lucide-react", "react-hook-form"],
+        },
+      },
+    },
   },
   server: {
     // Allow opening through any host (ngrok, LAN, etc.) in dev

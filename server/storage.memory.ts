@@ -191,6 +191,16 @@ export class MemoryStorage implements IStorage {
   }
 
   async deleteUser(id: string): Promise<void> {
+    for (let i = audio.length - 1; i >= 0; i--) {
+      if (audio[i].userId === id) {
+        audio.splice(i, 1);
+      }
+    }
+    for (let i = attendance.length - 1; i >= 0; i--) {
+      if (attendance[i].userId === id) {
+        attendance.splice(i, 1);
+      }
+    }
     const idx = users.findIndex(u => u.id === id);
     if (idx !== -1) users.splice(idx, 1);
   }

