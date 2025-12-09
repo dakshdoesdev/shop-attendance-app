@@ -1,6 +1,5 @@
 node_modules
 .DS_Store
-server
 server/uploads/
 dist/uploads/
 
@@ -8,4 +7,7 @@ dist/uploads/
 vite.config.ts.*
 *.tar.gz
 .env
+.env.local
+.env.production
+uploads/
 
